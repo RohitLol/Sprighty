@@ -1,0 +1,36 @@
+# ── Vendor binaries (download separately — see README) ─────────────────────────
+vendor/scrcpy/
+
+# ── Python ─────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Qt / app runtime ───────────────────────────────────────────────────────────
+*.ini
+
+# ── IDE / OS ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.user
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Logs & temp ────────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+
+# ── PyInstaller ────────────────────────────────────────────────────────────────
+*.spec
