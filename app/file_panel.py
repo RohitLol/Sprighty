@@ -56,7 +56,7 @@ class _Signals(QObject):
 
 
 class _ListDirSignals(QObject):
-    done = Signal(list)   # list[FileEntry]
+    done = Signal(object)   # list[FileEntry] — object avoids cross-thread marshal issues
 
 
 class _ListDirWorker(QRunnable):
@@ -64,7 +64,7 @@ class _ListDirWorker(QRunnable):
         super().__init__()
         self.path = path
         self.signals = _ListDirSignals()
-        self.setAutoDelete(True)
+        self.setAutoDelete(False)   # keep alive until signal is delivered
 
     def run(self):
         entries = adb_files.list_dir(self.path)
@@ -72,7 +72,7 @@ class _ListDirWorker(QRunnable):
 
 
 class _ScanPhotosSignals(QObject):
-    done = Signal(list)   # list[str] remote paths
+    done = Signal(object)   # list[str] — object avoids cross-thread marshal issues
 
 
 class _ScanPhotosWorker(QRunnable):
@@ -80,7 +80,7 @@ class _ScanPhotosWorker(QRunnable):
         super().__init__()
         self.max_count = max_count
         self.signals = _ScanPhotosSignals()
-        self.setAutoDelete(True)
+        self.setAutoDelete(False)   # keep alive until signal is delivered
 
     def run(self):
         photos = adb_files.list_photos(self.max_count)
@@ -206,6 +206,7 @@ class FileBrowserTab(QWidget):
         self._view_mode   = "list"      # "list" | "grid"
         self._pool        = QThreadPool.globalInstance()
         self._pending     = 0           # in-flight transfer count
+        self._list_worker: _ListDirWorker | None = None   # keep ref until signal fires
         self._setup_ui()
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -392,6 +393,7 @@ class FileBrowserTab(QWidget):
         self._progress.show()
         w = _ListDirWorker(path)
         w.signals.done.connect(self._on_dir_listed)
+        self._list_worker = w           # prevent GC before signal fires
         self._pool.start(w)
 
     def _on_dir_listed(self, entries: list):
@@ -545,10 +547,11 @@ class PhotoGridTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._cache_dir = tempfile.mkdtemp(prefix="sprightly_thumbs_")
-        self._pool      = QThreadPool.globalInstance()
-        self._path_map: dict[str, QListWidgetItem] = {}
-        self._pending   = 0
+        self._cache_dir   = tempfile.mkdtemp(prefix="sprightly_thumbs_")
+        self._pool        = QThreadPool.globalInstance()
+        self._path_map:   dict[str, QListWidgetItem] = {}
+        self._pending     = 0
+        self._scan_worker: _ScanPhotosWorker | None = None  # keep ref until signal fires
         self._setup_ui()
 
     def _setup_ui(self):
@@ -605,6 +608,7 @@ class PhotoGridTab(QWidget):
         self._status.setText("Scanning device for photos…")
         w = _ScanPhotosWorker(200)
         w.signals.done.connect(self._on_photos_listed)
+        self._scan_worker = w           # prevent GC before signal fires
         self._pool.start(w)
 
     def _on_photos_listed(self, photos: list):

@@ -185,17 +185,16 @@ class CursorDot(QWidget):
 
 class MirrorContainer(QWidget):
     """
-    Fixed-size (MIRROR_W × MIRROR_H) host for the embedded scrcpy SDL window.
+    Scalable host for the embedded scrcpy SDL window.
+    Fills whatever size its parent gives it; scales scrcpy hwnd accordingly.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(MIRROR_W, MIRROR_H)
         self.setStyleSheet("background:#06060A;")
 
         # ── Styled empty-state placeholder ────────────────────────────────────
         self._placeholder = QWidget(self)
-        self._placeholder.resize(MIRROR_W, MIRROR_H)
         self._placeholder.setStyleSheet("background:transparent;")
 
         ph_lay = QVBoxLayout(self._placeholder)
@@ -282,16 +281,25 @@ class MirrorContainer(QWidget):
         super().mousePressEvent(event)
 
     def _do_embed(self):
+        w, h = self.width() or MIRROR_W, self.height() or MIRROR_H
         parent_hwnd = int(self.winId())
-        _embed(self._scrcpy_hwnd, parent_hwnd, MIRROR_W, MIRROR_H)
+        _embed(self._scrcpy_hwnd, parent_hwnd, w, h)
         self._placeholder.hide()
         self._update_dot_rect()
 
     def _update_dot_rect(self):
         tl = self.mapToGlobal(QPoint(0, 0))
-        rect = QRect(tl.x(), tl.y(), MIRROR_W, MIRROR_H)
+        rect = QRect(tl.x(), tl.y(), self.width(), self.height())
         self._dot.set_mirror_rect(rect)
         _middle_click_hook.set_mirror_rect(rect)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        w, h = self.width(), self.height()
+        self._placeholder.resize(w, h)
+        if self._scrcpy_hwnd:
+            user32.MoveWindow(self._scrcpy_hwnd, 0, 0, w, h, True)
+        self._update_dot_rect()
 
     def moveEvent(self, event):
         super().moveEvent(event)
@@ -322,17 +330,40 @@ _BTN_EDGE     = QColor(0x2C, 0x2C, 0x3A)
 class PhoneFrame(QWidget):
     """Decorative Pixel 8a–style body drawn around the MirrorContainer.
 
+    Scales proportionally to fill whatever height it is given.
     Provides the same public API as MirrorContainer so MainWindow can treat
     it as a drop-in replacement.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(PHONE_W, PHONE_H)
+        self.setMinimumSize(120, 260)
 
-        # Place the real mirror widget at (FRAME_S, FRAME_T)
         self._mirror = MirrorContainer(self)
-        self._mirror.move(FRAME_S, FRAME_T)
+        self._reflow()
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+
+    def _reflow(self):
+        """Scale and position MirrorContainer to fill available space."""
+        pw, ph = self.width() or PHONE_W, self.height() or PHONE_H
+        # Compute scale factor from current frame size vs reference
+        scale = min(pw / PHONE_W, ph / PHONE_H, 1.0)
+        scale = max(scale, 0.2)
+
+        ft = max(int(FRAME_T * scale), 6)
+        fb = max(int(FRAME_B * scale), 8)
+        fs = max(int(FRAME_S * scale), 4)
+
+        mw = pw - 2 * fs
+        mh = ph - ft - fb
+
+        self._mirror.move(fs, ft)
+        self._mirror.resize(mw, mh)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reflow()
 
     # ── Proxy API ─────────────────────────────────────────────────────────────
 
@@ -357,10 +388,13 @@ class PhoneFrame(QWidget):
 
         w = float(self.width())
         h = float(self.height())
-        sx = float(FRAME_S)
-        sy = float(FRAME_T)
-        sw = float(MIRROR_W)
-        sh = float(MIRROR_H)
+        # Derive bezel sizes from current scale
+        scale = min(w / PHONE_W, h / PHONE_H, 1.0)
+        scale = max(scale, 0.2)
+        sx = float(max(int(FRAME_S * scale), 4))
+        sy = float(max(int(FRAME_T * scale), 6))
+        sw = w - 2.0 * sx
+        sh = h - sy - float(max(int(FRAME_B * scale), 8))
 
         # ── Full phone body ────────────────────────────────────────────────────
         body = QPainterPath()

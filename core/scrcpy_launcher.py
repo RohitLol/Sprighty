@@ -68,10 +68,11 @@ class ScrcpyLauncher(QObject):
     def _build_args(self, device: Device, settings: ScrcpySettings) -> list[str]:
         args = [str(scrcpy_exe())]
 
-        if device.transport == Transport.USB:
-            args += ["-s", device.serial]
-        else:
+        wifi = device.transport == Transport.TCPIP
+        if wifi:
             args += ["-s", f"{device.ip}:{device.port}"]
+        else:
+            args += ["-s", device.serial]
 
         args += [
             "--max-size", str(settings.max_size),
@@ -81,11 +82,17 @@ class ScrcpyLauncher(QObject):
             "--window-title", self._window_title,
             "--window-borderless",
             "--no-audio",
-            "--video-buffer=0",
-            # Fixed Pixel 8a mirror dimensions — matches MirrorContainer exactly
             "--window-width", str(MIRROR_W),
             "--window-height", str(MIRROR_H),
         ]
+
+        if wifi:
+            # Over WiFi, a small buffer smooths jitter; zero-buffer causes blank screen
+            args += ["--video-buffer", "200"]
+        else:
+            # USB is low-latency; minimal buffer for real-time feel
+            args += ["--video-buffer", "0"]
+
         return args
 
     def _build_env(self) -> dict:
