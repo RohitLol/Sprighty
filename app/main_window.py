@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.file_panel import FilePanel
-from app.mirror_container import PhoneFrame
+from app.mirror_container import MIRROR_H, PHONE_W, PHONE_H, PhoneFrame
 from app.pairing_dialog import PairingDialog
 from app.settings_dialog import SettingsDialog
 from app.usb_dialog import UsbDialog
@@ -37,7 +37,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Sprightly")
-        self.setMinimumSize(320 + 280, 500)   # phone_min + panel_min × height_min
+        self.setMinimumSize(PHONE_W + 440, MIRROR_H + 80)
 
         self._launcher = ScrcpyLauncher(self)
         self._device_manager = DeviceManager(self)
@@ -150,17 +150,17 @@ class MainWindow(QMainWindow):
         self._splitter = splitter
         splitter.setHandleWidth(3)
 
-        # Left pane: dark wrapper that scales phone frame to available height
+        # Left pane: dark wrapper that holds the phone frame widget
         left_wrap = QWidget()
         left_wrap.setStyleSheet("background:#000;")
-        left_wrap.setMinimumWidth(180)
+        left_wrap.setFixedWidth(PHONE_W + 20)   # 10 px padding each side
         lv = QVBoxLayout(left_wrap)
         lv.setContentsMargins(10, 10, 10, 10)
         lv.setSpacing(0)
 
         self._mirror = PhoneFrame()
-        self._mirror.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        lv.addWidget(self._mirror, 1, Qt.AlignHCenter)
+        lv.addWidget(self._mirror, 0, Qt.AlignHCenter | Qt.AlignTop)
+        lv.addStretch()
 
         splitter.addWidget(left_wrap)
 
