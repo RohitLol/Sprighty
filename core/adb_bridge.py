@@ -195,6 +195,11 @@ def get_foreground_url() -> str | None:
                                  timeout=8)
     if rc != 0 or not out:
         return None
-    # Search for any URL in the activity dump
-    match = re.search(r'https?://[^\s"\'\\>]+', out)
-    return match.group(0).rstrip(").,;") if match else None
+    # Try intent data first — most reliable for YouTube, Chrome, browsers
+    # e.g. "dat=https://www.youtube.com/watch?v=abc123"
+    m = re.search(r'dat=(https?://[^\s"\'\\>)]+)', out)
+    if m:
+        return m.group(1).rstrip(").,;")
+    # Fallback: any URL in the dump
+    m = re.search(r'https?://[^\s"\'\\>]+', out)
+    return m.group(0).rstrip(").,;") if m else None

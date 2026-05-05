@@ -10,6 +10,7 @@ from core import adb_bridge
 from core.adb_discover import find_adb_port
 from core.settings_store import save_paired_device
 from core.worker import run_async
+import re
 
 
 class PairingDialog(QDialog):
@@ -138,6 +139,14 @@ class PairingDialog(QDialog):
         form.addRow("Connect Port:", self._c_port)
         lay.addLayout(form)
 
+        self._btn_mdns = QPushButton("🔍  Scan for nearby devices (mDNS)")
+        self._btn_mdns.setToolTip(
+            "Automatically find devices on the same Wi-Fi network.\n"
+            "Requires Wireless Debugging to be ON on the phone."
+        )
+        self._btn_mdns.clicked.connect(self._do_mdns_scan)
+        lay.addWidget(self._btn_mdns)
+
         self._btn_auto = QPushButton("Auto-detect Port && Connect")
         self._btn_auto.setToolTip(
             "Scans the phone for an open ADB port automatically.\n"
@@ -198,6 +207,51 @@ class PairingDialog(QDialog):
         else:
             _, ip, port = result
             self._ok(f"✓ Connected to {ip}:{port} — device should appear in the list.")
+
+    def _do_mdns_scan(self):
+        if self._busy:
+            return
+        self._set_busy(True, "Scanning for devices on the network via mDNS…")
+
+        def _work():
+            rc, out, err = adb_bridge._run("mdns", "services")
+            if rc != 0:
+                return ("unsupported",)
+            devices = []
+            for line in out.splitlines():
+                # lines look like: name  _adb-tls-connect._tcp  192.168.1.5:12345
+                if "_adb-tls-connect" in line:
+                    m = re.search(r"(\d+\.\d+\.\d+\.\d+):(\d+)", line)
+                    if m:
+                        devices.append((m.group(1), int(m.group(2))))
+            return ("ok", devices)
+
+        run_async(_work, on_done=self._on_mdns_done)
+
+    def _on_mdns_done(self, result):
+        self._set_busy(False)
+        if result is None or result[0] == "unsupported":
+            self._err(
+                "mDNS scan not available. Enter the IP manually and use\n"
+                "'Auto-detect Port' to connect without typing the port."
+            )
+            return
+        _, devices = result
+        if not devices:
+            self._err(
+                "No devices found. Make sure:\n"
+                "• Wireless Debugging is ON on your phone\n"
+                "• Phone and PC are on the same Wi-Fi network"
+            )
+            return
+        ip, port = devices[0]
+        self._c_ip.setText(ip)
+        self._c_port.setValue(port)
+        if len(devices) == 1:
+            self._ok(f"Found device at {ip}:{port} — click 'Connect with entered port'.")
+        else:
+            others = ", ".join(f"{d[0]}:{d[1]}" for d in devices[1:])
+            self._ok(f"Found {len(devices)} devices. Using {ip}:{port}. Others: {others}")
 
     def _do_auto_connect(self):
         if self._busy:
@@ -272,7 +326,7 @@ class PairingDialog(QDialog):
 
     def _set_busy(self, busy: bool, msg: str = ""):
         self._busy = busy
-        for btn in (self._btn_pair, self._btn_auto, self._btn_manual):
+        for btn in (self._btn_pair, self._btn_mdns, self._btn_auto, self._btn_manual):
             btn.setEnabled(not busy)
         if msg:
             self._info(msg)

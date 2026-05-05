@@ -55,6 +55,38 @@ class _Signals(QObject):
     thumb  = Signal(str, str)         # remote_path, local_path
 
 
+class _ListDirSignals(QObject):
+    done = Signal(list)   # list[FileEntry]
+
+
+class _ListDirWorker(QRunnable):
+    def __init__(self, path: str):
+        super().__init__()
+        self.path = path
+        self.signals = _ListDirSignals()
+        self.setAutoDelete(True)
+
+    def run(self):
+        entries = adb_files.list_dir(self.path)
+        self.signals.done.emit(entries)
+
+
+class _ScanPhotosSignals(QObject):
+    done = Signal(list)   # list[str] remote paths
+
+
+class _ScanPhotosWorker(QRunnable):
+    def __init__(self, max_count: int):
+        super().__init__()
+        self.max_count = max_count
+        self.signals = _ScanPhotosSignals()
+        self.setAutoDelete(True)
+
+    def run(self):
+        photos = adb_files.list_photos(self.max_count)
+        self.signals.done.emit(photos)
+
+
 class _PullWorker(QRunnable):
     def __init__(self, remote_path: str, local_dir: str):
         super().__init__()
@@ -97,14 +129,15 @@ class _ThumbWorker(QRunnable):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _DropList(QListWidget):
-    """QListWidget that accepts file drops from Windows Explorer."""
+    """QListWidget that accepts drops from Windows Explorer and supports drag-out."""
     files_dropped = Signal(list)   # list[str] of local paths
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
-        self.setDragDropMode(QAbstractItemView.DropOnly)
+        self.setDragDropMode(QAbstractItemView.DragDrop)
         self.setDefaultDropAction(Qt.CopyAction)
+        self._cache_dir = tempfile.mkdtemp(prefix="sprightly_drag_")
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -130,6 +163,28 @@ class _DropList(QListWidget):
             event.acceptProposedAction()
         else:
             super().dropEvent(event)
+
+    def startDrag(self, supported_actions):
+        """Drag selected files out to Windows Explorer (pulls to temp first)."""
+        items = self.selectedItems()
+        if not items:
+            return
+        local_paths = []
+        for item in items:
+            entry = item.data(Qt.UserRole)
+            if entry and not entry.is_dir:
+                ok, _ = adb_files.pull_file(entry.path, self._cache_dir)
+                if ok:
+                    local = os.path.join(self._cache_dir, entry.name)
+                    if os.path.exists(local):
+                        local_paths.append(local)
+        if not local_paths:
+            return
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(p) for p in local_paths])
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.CopyAction)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -334,12 +389,17 @@ class FileBrowserTab(QWidget):
         self._btn_back.setEnabled(len(self._path_stack) > 1)
         self._list.clear()
         self._set_status("Loading…")
+        self._progress.show()
+        w = _ListDirWorker(path)
+        w.signals.done.connect(self._on_dir_listed)
+        self._pool.start(w)
 
-        self._entries = adb_files.list_dir(path)
+    def _on_dir_listed(self, entries: list):
+        self._progress.hide()
+        self._entries = entries
         if not self._entries:
             self._set_status("Empty folder or device not connected.")
             return
-
         self._populate(self._entries)
 
     def _populate(self, entries: list):
@@ -488,6 +548,7 @@ class PhotoGridTab(QWidget):
         self._cache_dir = tempfile.mkdtemp(prefix="sprightly_thumbs_")
         self._pool      = QThreadPool.globalInstance()
         self._path_map: dict[str, QListWidgetItem] = {}
+        self._pending   = 0
         self._setup_ui()
 
     def _setup_ui(self):
@@ -540,8 +601,14 @@ class PhotoGridTab(QWidget):
     def _load_photos(self):
         self._grid.clear()
         self._path_map.clear()
+        self._progress.show()
         self._status.setText("Scanning device for photos…")
-        photos = adb_files.list_photos(max_count=80)
+        w = _ScanPhotosWorker(200)
+        w.signals.done.connect(self._on_photos_listed)
+        self._pool.start(w)
+
+    def _on_photos_listed(self, photos: list):
+        self._progress.hide()
         if not photos:
             self._status.setText("No photos found or device not connected.")
             return

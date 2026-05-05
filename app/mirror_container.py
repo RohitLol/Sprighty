@@ -275,6 +275,12 @@ class MirrorContainer(QWidget):
         self._scrcpy_hwnd = hwnd
         self._do_embed()
 
+    def mousePressEvent(self, event):
+        """Give keyboard focus to the embedded scrcpy window on click."""
+        if self._scrcpy_hwnd:
+            user32.SetFocus(self._scrcpy_hwnd)
+        super().mousePressEvent(event)
+
     def _do_embed(self):
         parent_hwnd = int(self.winId())
         _embed(self._scrcpy_hwnd, parent_hwnd, MIRROR_W, MIRROR_H)

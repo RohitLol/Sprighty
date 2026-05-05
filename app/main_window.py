@@ -43,6 +43,9 @@ class MainWindow(QMainWindow):
         self._device_manager = DeviceManager(self)
         self._devices: dict[str, Device] = {}
         self._mirroring_serial: str | None = None
+        self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.timeout.connect(self._file_panel_auto_refresh)
+        self._auto_refresh_timer.setInterval(30_000)  # 30 s
 
         self._setup_ui()
         self._setup_tray()
@@ -133,8 +136,18 @@ class MainWindow(QMainWindow):
         act_clip.triggered.connect(self._push_clipboard)
         tb.addAction(act_clip)
 
+        tb.addSeparator()
+
+        self._act_panel = QAction(icon("panel"), "Files", self)
+        self._act_panel.setToolTip("Toggle file panel on/off (phone-only mode)")
+        self._act_panel.setCheckable(True)
+        self._act_panel.setChecked(True)
+        self._act_panel.triggered.connect(self._toggle_panel)
+        tb.addAction(self._act_panel)
+
         # ── Central: splitter ─────────────────────────────────────────────────
         splitter = QSplitter(Qt.Horizontal)
+        self._splitter = splitter
         splitter.setHandleWidth(3)
 
         # Left pane: dark wrapper that holds the phone frame widget
@@ -222,7 +235,19 @@ class MainWindow(QMainWindow):
 
     def _reconnect_saved_devices(self):
         for saved in load_paired_devices():
-            run_async(adb_bridge.connect, saved.ip, saved.port)
+            run_async(self._reconnect_one, saved.ip, saved.port)
+
+    def _reconnect_one(self, ip: str, port: int):
+        """Try saved port; fall back to port auto-detect if it fails."""
+        ok, _ = adb_bridge.connect(ip, port)
+        if not ok:
+            from core.adb_discover import find_adb_port
+            from core.settings_store import save_paired_device
+            new_port = find_adb_port(ip)
+            if new_port:
+                ok2, _ = adb_bridge.connect(ip, new_port)
+                if ok2:
+                    save_paired_device(ip, new_port)
 
     def _restore_geometry(self):
         geom = load_window_geometry()
@@ -231,11 +256,22 @@ class MainWindow(QMainWindow):
 
     # ── Device management ─────────────────────────────────────────────────────
 
+    def _toggle_panel(self):
+        visible = self._file_panel.isVisible()
+        self._file_panel.setVisible(not visible)
+        self._act_panel.setChecked(not visible)
+
+    def _file_panel_auto_refresh(self):
+        """Auto-refresh file list every 30s while a device is connected."""
+        if self._devices:
+            self._file_panel.refresh_files()
+
     def _on_device_added(self, device: Device):
         self._devices[device.serial] = device
         self._rebuild_combo()
         adb_bridge.set_target(device.serial)
         QTimer.singleShot(800, self._file_panel.refresh_files)
+        self._auto_refresh_timer.start()
         self._tray.showMessage("Sprightly", f"{device.display_name} connected",
                                QSystemTrayIcon.Information, 2000)
         self._status.showMessage(f"{device.display_name} connected.")
@@ -244,6 +280,8 @@ class MainWindow(QMainWindow):
         self._devices.pop(device.serial, None)
         if self._mirroring_serial == device.serial:
             self._launcher.stop()
+        if not self._devices:
+            self._auto_refresh_timer.stop()
         self._rebuild_combo()
         self._status.showMessage(f"{device.display_name} disconnected.")
 
