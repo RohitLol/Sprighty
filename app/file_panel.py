@@ -189,15 +189,16 @@ class _DropList(QListWidget):
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event):
-        # Only intercept left-button drags that haven't been handled yet
-        if (event.buttons() & Qt.LeftButton
-                and self._drag_origin is not None
-                and not self._dragging):
-            dist = (event.pos() - self._drag_origin).manhattanLength()
-            if dist >= QApplication.startDragDistance():
-                self._dragging = True
-                self._do_drag_out()
-                return   # don't pass the event on — we took over
+        # While the left button is held from a press we recorded, consume ALL
+        # move events so Qt's rubber-band selection never activates.  Only once
+        # the drag threshold is crossed do we kick off the actual file pull.
+        if event.buttons() & Qt.LeftButton and self._drag_origin is not None:
+            if not self._dragging:
+                dist = (event.pos() - self._drag_origin).manhattanLength()
+                if dist >= QApplication.startDragDistance():
+                    self._dragging = True
+                    self._do_drag_out()
+            return  # swallow event — prevent rubber-band multi-select
         super().mouseMoveEvent(event)
 
     def _do_drag_out(self):
@@ -245,6 +246,7 @@ class _DropList(QListWidget):
             else:
                 self.status_fn("Drag cancelled.")
         self._dragging = False
+        self._drag_origin = None   # clear so a missed release doesn't re-trigger
 
 
 # ─────────────────────────────────────────────────────────────────────────────

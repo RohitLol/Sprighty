@@ -1,5 +1,7 @@
 """ADB file system helpers: listing, pulling, pushing, photo discovery."""
 
+import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -70,11 +72,53 @@ def list_dir(remote_path: str) -> list[FileEntry]:
 
 
 def pull_file(remote_path: str, local_dir: str) -> tuple[bool, str]:
-    """Pull a single file (or directory) from device to local_dir."""
+    """Pull a single file from device to local_dir.
+
+    Tries ``adb pull`` first (fast file-sync protocol).
+    Falls back to ``adb exec-out cat`` for files that the sync protocol
+    cannot reach — Android 11+ FUSE / scoped-storage mount restrictions
+    block the sync daemon from accessing some paths (e.g. Download) even
+    though ``adb shell`` can read them fine.
+    """
+    local_path = os.path.join(local_dir, Path(remote_path).name)
+
+    # ── Attempt 1: standard adb pull (file-sync protocol) ────────────────────
     rc, stdout, stderr = _run_shell("pull", remote_path, local_dir, timeout=120)
-    ok = rc == 0
-    msg = stdout.strip() or stderr.strip()
-    return ok, msg
+    if rc == 0:
+        return True, stdout.strip() or stderr.strip()
+
+    first_err = stderr.strip() or stdout.strip()
+
+    # ── Attempt 2: exec-out cat (exec channel, not sync) ─────────────────────
+    # exec-out runs the command via the exec channel so it inherits the same
+    # FS access as `adb shell`, bypassing the sync-protocol FUSE restriction.
+    # We capture raw bytes and write directly — safe for all file types.
+    from utils.vendor_paths import adb_exe as _adb_exe
+    serial = adb_bridge.get_target()
+    exe = str(_adb_exe())
+    cmd = [exe]
+    if serial:
+        cmd += ["-s", serial]
+    # Pass path as a separate argv element — exec-out does NOT invoke a shell,
+    # so parentheses and other special chars in filenames are harmless.
+    cmd += ["exec-out", "cat", remote_path]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=120,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            os.makedirs(local_dir, exist_ok=True)
+            with open(local_path, "wb") as f:
+                f.write(proc.stdout)
+            return True, ""
+    except Exception as exc:
+        return False, f"{first_err}; fallback failed: {exc}"
+
+    return False, first_err
 
 
 def push_file(local_path: str, remote_dir: str) -> tuple[bool, str]:

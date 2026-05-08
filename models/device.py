@@ -25,7 +25,16 @@ class Device:
 
     @property
     def display_name(self) -> str:
-        name = self.model if self.model else self.serial
+        if self.model:
+            name = self.model
+        elif self.transport == Transport.TCPIP:
+            # mDNS or IP-connected device with no model info — show IP or generic
+            name = f"Phone ({self.ip})" if self.ip else "Phone"
+        elif len(self.serial) > 22 or "_tcp" in self.serial:
+            # Long/mDNS-style serial misclassified as USB — show a clean label
+            name = "Phone"
+        else:
+            name = self.serial
         if self.transport == Transport.TCPIP:
             return f"{name} (WiFi)"
         return name

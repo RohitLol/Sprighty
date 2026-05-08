@@ -87,7 +87,10 @@ def list_devices() -> list[Device]:
         }
         state = state_map.get(raw_state, DeviceState.UNKNOWN)
 
-        transport = Transport.TCPIP if re.match(r"^\d+\.\d+\.\d+\.\d+:\d+$", serial) else Transport.USB
+        # Match both  192.168.x.x:port  and  adb-XXXX._adb-tls-connect._tcp.local:port
+        _is_ip_port  = bool(re.match(r"^\d+\.\d+\.\d+\.\d+:\d+$", serial))
+        _is_mdns     = bool(re.search(r"_tcp.*:\d+$", serial))
+        transport = Transport.TCPIP if (_is_ip_port or _is_mdns) else Transport.USB
 
         model = ""
         for part in parts[2:]:
@@ -97,8 +100,14 @@ def list_devices() -> list[Device]:
 
         ip, port = "", 5555
         if transport == Transport.TCPIP:
-            ip, _, p = serial.partition(":")
-            port = int(p) if p.isdigit() else 5555
+            if _is_ip_port:
+                ip, _, p = serial.partition(":")
+                port = int(p) if p.isdigit() else 5555
+            else:
+                # mDNS serial — extract port from the trailing :PORT
+                m = re.search(r":(\d+)$", serial)
+                if m:
+                    port = int(m.group(1))
 
         devices.append(Device(serial=serial, state=state, transport=transport, model=model, ip=ip, port=port))
 

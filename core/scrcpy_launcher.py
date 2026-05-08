@@ -21,6 +21,7 @@ class ScrcpyLauncher(QObject):
         self._process: subprocess.Popen | None = None
         self._device: Device | None = None
         self._window_title: str = ""
+        self._killed = False   # True when we initiated the kill ourselves
 
     @property
     def is_running(self) -> bool:
@@ -63,6 +64,7 @@ class ScrcpyLauncher(QObject):
 
     def stop(self) -> None:
         if self._process and self._process.poll() is None:
+            self._killed = True
             self._process.kill()
 
     def _build_args(self, device: Device, settings: ScrcpySettings) -> list[str]:
@@ -116,12 +118,35 @@ class ScrcpyLauncher(QObject):
         env["ADB"] = str(adb_exe())
         return env
 
+    # Lines that appear in scrcpy stderr during normal startup / operation.
+    # They must never be surfaced as errors to the user.
+    _STDERR_NOISE = (
+        "file pushed",      # "scrcpy-server: 1 file pushed, 0 skipped. 7.4 MB/s…"
+        "file skipped",
+        "MB/s",             # transfer-rate stats
+        "bytes in 0.",      # short push duration  e.g. "(90980 bytes in 0.012s)"
+        "adb-tls",          # mDNS TLS reconnect messages
+        "tls-connect",
+    )
+
     def _monitor(self):
         stdout, stderr = self._process.communicate()
         rc = self._process.returncode
+        was_killed = self._killed
+        self._killed = False
         self._process = None
-        if rc == 0 or rc == -1:
+
+        # rc == 0  → scrcpy exited cleanly (user closed the window)
+        # rc == 1  → Windows TerminateProcess from our kill() call
+        # rc == -1 → POSIX SIGKILL (shouldn't happen on Windows, but guard anyway)
+        if rc == 0 or was_killed:
             self.mirror_stopped.emit()
         else:
-            msg = stderr.decode(errors="replace").strip()
+            raw = stderr.decode(errors="replace").strip()
+            # Strip normal startup / connection chatter so we only show real errors
+            lines = [
+                ln for ln in raw.splitlines()
+                if not any(noise in ln for noise in self._STDERR_NOISE)
+            ]
+            msg = "\n".join(lines).strip()
             self.mirror_error.emit(msg or f"scrcpy exited with code {rc}")
