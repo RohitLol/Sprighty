@@ -173,6 +173,31 @@ def volume_down() -> None:
     keyevent(25)   # KEYCODE_VOLUME_DOWN
 
 
+def swipe_h(direction: int) -> None:
+    """Horizontal swipe gesture on the device.
+
+    Parameters
+    ----------
+    direction : +1 = swipe right (previous item / scroll back)
+               -1 = swipe left  (next item / scroll forward)
+    """
+    # Query actual display size so coordinates work on any resolution.
+    rc, out, _ = _run_on_device("shell", "wm", "size", timeout=3)
+    w, h = 1080, 2400   # safe fallback
+    if rc == 0:
+        m = re.search(r'(\d+)x(\d+)', out)
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+    cx, cy = w // 2, h // 2
+    offset = w // 3     # swipe ≈ 33 % of screen width
+    if direction > 0:   # swipe right → previous item
+        x1, x2 = cx - offset, cx + offset
+    else:               # swipe left → next item
+        x1, x2 = cx + offset, cx - offset
+    _run_on_device("shell", "input", "swipe",
+                   str(x1), str(cy), str(x2), str(cy), "200")
+
+
 def push_clipboard_text(text: str) -> bool:
     """Push text to the device clipboard via ADB input text (best-effort).
 
@@ -198,69 +223,87 @@ def get_foreground_url() -> str | None:
 
     Detection strategy
     ------------------
-    1. ``dumpsys media_session`` (15 s) — run FIRST because it contains
-       YouTube's ART_URI thumbnail URL (``i.ytimg.com/vi/VIDEO_ID/``), which
-       is the most reliable signal for the currently-playing video.
-    2. ``dumpsys activity top`` (10 s) — tells us the foreground package and
-       provides browser/generic URL fallback.
+    Both ADB calls use on-device grep/head so only a handful of lines are
+    transferred over WiFi — the full ``dumpsys`` output can be megabytes and
+    causes silent TimeoutExpired exceptions that the worker swallows as None.
+
+    1. ``dumpsys media_session | grep …`` — grabs artUri / mediaId lines for
+       YouTube (i.ytimg.com thumbnail URL is always present when playing) and
+       Spotify/Netflix URIs.
+    2. ``dumpsys activity top | grep …`` — grabs TASK/ACTIVITY/URL lines to
+       identify the foreground package and browser tab URLs.
 
     Supported apps
     --------------
-    YouTube / YT Music  — video ID from media session ART_URI or activity args
+    YouTube / YT Music  — video ID from media session ART_URI or MEDIA_ID
     Spotify             — spotify:…:ID URI  →  open.spotify.com URL
     Browser             — intent dat= URL from the current task
     Any other app       — falls back to any https URL in the activity dump
     """
-    # ── Step 1: media session — best signal for media apps ───────────────────
-    # Run with a generous timeout; the ytimg ART_URI is always present when
-    # YouTube is actively playing a video.
-    rc_m, out_m, _ = _run_on_device("shell", "dumpsys", "media_session",
-                                     timeout=15)
-    ms_dump = out_m if rc_m == 0 else ""
+    # ── Step 1: grep media session for only the fields we care about ──────────
+    # Running the full dumpsys over WiFi can easily exceed a 15 s timeout.
+    # Piping through grep on-device reduces the transfer to ~30 lines.
+    rc_m, ms_lines, _ = _run_on_device(
+        "shell",
+        "dumpsys media_session"
+        " | grep -iE 'ytimg|yt:video|spotify:|netflix|artUri|mediaId|ART_URI|MEDIA_ID|packageName|Package name'"
+        " | head -30",
+        timeout=8,
+    )
+    ms_dump = ms_lines if rc_m == 0 else ""
 
-    # ── Step 2: foreground activity dump ─────────────────────────────────────
-    # ``dumpsys activity top`` shows ONLY the currently visible task/activity.
-    # The first TASK line tells us the package; the rest may contain the URL.
-    rc_t, out_t, _ = _run_on_device("shell", "dumpsys", "activity", "top",
-                                     timeout=10)
-    out_t = out_t if rc_t == 0 else ""
+    # ── Step 2: grep activity top for TASK / ACTIVITY / URL lines ────────────
+    rc_t, top_lines, _ = _run_on_device(
+        "shell",
+        "dumpsys activity top"
+        " | grep -E 'TASK |ACTIVITY |dat=|https://|youtube|spotify|netflix|chrome|firefox'"
+        " | head -30",
+        timeout=8,
+    )
+    out_t = top_lines if rc_t == 0 else ""
 
     # ── Detect foreground package ─────────────────────────────────────────────
     pkg = ""
     if out_t:
-        # Android 14 indents the TASK line with leading spaces — use \s* not ^
+        # Android 14 indents the TASK line — match with \s*
         m = re.search(r'^\s*TASK\s+(\S+)', out_t, re.MULTILINE)
         if m:
             pkg = m.group(1).lower()
         else:
-            # Fallback: grab package from the ACTIVITY line  e.g.
-            # "  ACTIVITY com.google.android.youtube/.HomeActivity …"
+            # ACTIVITY line: "  ACTIVITY com.google.android.youtube/.HomeActivity …"
             m = re.search(r'ACTIVITY\s+([a-z][a-zA-Z0-9_.]+)/', out_t)
             if m:
                 pkg = m.group(1).lower()
 
-    # If pkg detection still failed, infer from media session package names
+    # Fall back to media session package hint
     if not pkg and ms_dump:
         for candidate in ("youtube", "spotify", "netflix", "chrome", "firefox"):
             if candidate in ms_dump.lower():
                 pkg = candidate
                 break
 
+    # Also scan activity grep results for known package substrings
+    if not pkg:
+        combined = (out_t + ms_dump).lower()
+        for candidate in ("youtube", "spotify", "netflix", "chrome", "firefox"):
+            if candidate in combined:
+                pkg = candidate
+                break
+
     # ── YouTube / YouTube Music ───────────────────────────────────────────────
     if "youtube" in pkg:
         # Check media_session FIRST — ART_URI thumbnail is the most reliable
-        # signal and is present even when the activity dump parsing is flaky.
+        # signal; it's present even when the activity dump parsing is flaky.
         for dump in (ms_dump, out_t):
-            # ① Best signal: thumbnail ART_URI always contains the video ID.
-            #   e.g. "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
-            m = re.search(r'i\.ytimg\.com/vi/([a-zA-Z0-9_-]{11})/', dump)
+            # ① ART_URI: "https://i.ytimg.com/vi/VIDEO_ID/hqdefault.jpg"
+            m = re.search(r'i\.ytimg\.com/vi/([a-zA-Z0-9_-]{11})', dump)
             if m:
                 return f"https://www.youtube.com/watch?v={m.group(1)}"
-            # ② MEDIA_ID field: "yt:video:VIDEO_ID"
+            # ② MEDIA_ID: "yt:video:VIDEO_ID"
             m = re.search(r'yt:video:([a-zA-Z0-9_-]{11})', dump)
             if m:
                 return f"https://www.youtube.com/watch?v={m.group(1)}"
-            # ③ videoId=XXXXXXXXXXX in fragment arguments (internally-navigated)
+            # ③ videoId=XXXXXXXXXX in fragment arguments
             m = re.search(r'[Vv]ideo[Ii]d[":\s=]+([a-zA-Z0-9_-]{11})', dump)
             if m:
                 return f"https://www.youtube.com/watch?v={m.group(1)}"
@@ -277,13 +320,13 @@ def get_foreground_url() -> str | None:
             if m:
                 return f"https://www.youtube.com/live/{m.group(1)}"
         # YouTube is open but we couldn't identify the video — stop here.
-        # Do NOT fall through: we'd return a stale URL from a background app.
+        # Do NOT fall through to avoid returning stale background URLs.
         return None
 
     # ── Spotify ───────────────────────────────────────────────────────────────
     if "spotify" in pkg:
         m = re.search(r'spotify:(track|episode|album|playlist|show):([a-zA-Z0-9]+)',
-                      ms_dump)
+                      ms_dump + out_t)
         if m:
             return f"https://open.spotify.com/{m.group(1)}/{m.group(2)}"
         return None
@@ -299,18 +342,15 @@ def get_foreground_url() -> str | None:
     _BROWSERS = ("chrome", "firefox", "edge", "samsung", "brave", "opera",
                  "vivaldi", "browser")
     if any(b in pkg for b in _BROWSERS):
-        # dat= is the reliable source for browser current-tab URLs
         m = re.search(r'dat=(https?://[^\s"\'\\>)]+)', out_t)
         if m:
             return m.group(1).rstrip(").,;")
-        # Broader scan of the top-activity dump (some browsers store URL differently)
         m = re.search(r'https?://(?!localhost)[^\s"\'\\>)]+', out_t)
         if m:
             return m.group(0).rstrip(").,;")
         return None
 
-    # ── Generic fallback (unknown app) ────────────────────────────────────────
-    # Only the TOP activity is searched — avoids picking up stale background URLs.
+    # ── Generic fallback ──────────────────────────────────────────────────────
     m = re.search(r'dat=(https?://[^\s"\'\\>)]+)', out_t)
     if m:
         return m.group(1).rstrip(").,;")

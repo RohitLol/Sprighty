@@ -217,6 +217,10 @@ class MainWindow(QMainWindow):
         # Middle-click in mirror → Recent Apps
         self._mirror.set_middle_click_callback(self._phone_recents)
 
+        # Shift+Scroll / Shift+Arrow over mirror → horizontal swipe
+        self._mirror.set_swipe_callbacks(self._phone_swipe_left,
+                                         self._phone_swipe_right)
+
         # Monitor PC clipboard for changes synced from the phone via scrcpy
         QApplication.clipboard().dataChanged.connect(self._on_clipboard_changed)
         self._last_clipboard = ""
@@ -421,6 +425,14 @@ class MainWindow(QMainWindow):
 
     def _phone_back(self):
         run_async(adb_bridge.back)
+
+    def _phone_swipe_left(self):
+        """Swipe left on device (next carousel item / scroll forward)."""
+        run_async(adb_bridge.swipe_h, -1)
+
+    def _phone_swipe_right(self):
+        """Swipe right on device (prev carousel item / scroll back)."""
+        run_async(adb_bridge.swipe_h, 1)
 
     # ── Clipboard ─────────────────────────────────────────────────────────────
 
