@@ -76,22 +76,34 @@ class ScrcpyLauncher(QObject):
 
         args += [
             "--max-size", str(settings.max_size),
-            "--video-bit-rate", settings.bitrate,
-            "--max-fps", str(settings.max_fps),
             "--video-codec", "h264",
             "--window-title", self._window_title,
             "--window-borderless",
             "--no-audio",
             "--window-width", str(MIRROR_W),
             "--window-height", str(MIRROR_H),
+            # Keep phone screen on while mirror is active.
+            # Without this: screen timeout kills the video stream while ADB
+            # (keyevent/shell) stays alive → mirror goes black mid-session.
+            "--stay-awake",
         ]
 
         if wifi:
-            # Over WiFi, a small buffer smooths jitter; zero-buffer causes blank screen
-            args += ["--video-buffer", "200"]
+            # WiFi: cap at 30 fps and 2 Mbps to reduce network load and latency.
+            # 50 ms video buffer smooths WiFi jitter without noticeable lag
+            # (previous 200 ms made the mirror feel sluggish).
+            args += [
+                "--video-bit-rate", "2M",
+                "--max-fps", "30",
+                "--video-buffer", "50",
+            ]
         else:
-            # USB is low-latency; minimal buffer for real-time feel
-            args += ["--video-buffer", "0"]
+            # USB: use full user settings and zero buffering for real-time feel.
+            args += [
+                "--video-bit-rate", settings.bitrate,
+                "--max-fps", str(settings.max_fps),
+                "--video-buffer", "0",
+            ]
 
         return args
 
