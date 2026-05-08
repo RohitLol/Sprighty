@@ -196,25 +196,36 @@ def push_clipboard_text(text: str) -> bool:
 def get_foreground_url() -> str | None:
     """Return the URL of whatever media/page is active in the foreground app.
 
-    Unlike a generic URL search, this is foreground-aware:
-    • detects which app is visible via ``dumpsys activity top``
-    • runs app-specific extraction so a background Reddit tab never
-      contaminates a YouTube result (the old bug)
+    Detection strategy
+    ------------------
+    1. ``dumpsys media_session`` (15 s) — run FIRST because it contains
+       YouTube's ART_URI thumbnail URL (``i.ytimg.com/vi/VIDEO_ID/``), which
+       is the most reliable signal for the currently-playing video.
+    2. ``dumpsys activity top`` (10 s) — tells us the foreground package and
+       provides browser/generic URL fallback.
 
     Supported apps
     --------------
-    YouTube / YT Music  — video ID from activity arguments or media session
+    YouTube / YT Music  — video ID from media session ART_URI or activity args
     Spotify             — spotify:…:ID URI  →  open.spotify.com URL
     Browser             — intent dat= URL from the current task
     Any other app       — falls back to any https URL in the activity dump
     """
-    # ── Step 1: foreground activity dump ─────────────────────────────────────
+    # ── Step 1: media session — best signal for media apps ───────────────────
+    # Run with a generous timeout; the ytimg ART_URI is always present when
+    # YouTube is actively playing a video.
+    rc_m, out_m, _ = _run_on_device("shell", "dumpsys", "media_session",
+                                     timeout=15)
+    ms_dump = out_m if rc_m == 0 else ""
+
+    # ── Step 2: foreground activity dump ─────────────────────────────────────
     # ``dumpsys activity top`` shows ONLY the currently visible task/activity.
     # The first TASK line tells us the package; the rest may contain the URL.
     rc_t, out_t, _ = _run_on_device("shell", "dumpsys", "activity", "top",
-                                     timeout=8)
+                                     timeout=10)
     out_t = out_t if rc_t == 0 else ""
 
+    # ── Detect foreground package ─────────────────────────────────────────────
     pkg = ""
     if out_t:
         # Android 14 indents the TASK line with leading spaces — use \s* not ^
@@ -228,32 +239,24 @@ def get_foreground_url() -> str | None:
             if m:
                 pkg = m.group(1).lower()
 
-    # If pkg detection still failed, peek at the media session to infer the app
-    ms_dump = ""
-    def _media_session() -> str:
-        nonlocal ms_dump
-        if not ms_dump:
-            rc, out, _ = _run_on_device("shell", "dumpsys", "media_session", timeout=8)
-            ms_dump = out if rc == 0 else ""
-        return ms_dump
-
-    # Infer package from media session when TASK/ACTIVITY parsing failed
-    if not pkg:
-        ms = _media_session()
+    # If pkg detection still failed, infer from media session package names
+    if not pkg and ms_dump:
         for candidate in ("youtube", "spotify", "netflix", "chrome", "firefox"):
-            if candidate in ms.lower():
+            if candidate in ms_dump.lower():
                 pkg = candidate
                 break
 
     # ── YouTube / YouTube Music ───────────────────────────────────────────────
     if "youtube" in pkg:
-        for dump in (out_t, _media_session()):
+        # Check media_session FIRST — ART_URI thumbnail is the most reliable
+        # signal and is present even when the activity dump parsing is flaky.
+        for dump in (ms_dump, out_t):
             # ① Best signal: thumbnail ART_URI always contains the video ID.
             #   e.g. "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
             m = re.search(r'i\.ytimg\.com/vi/([a-zA-Z0-9_-]{11})/', dump)
             if m:
                 return f"https://www.youtube.com/watch?v={m.group(1)}"
-            # ② MEDIA_ID field: "yt:video:VIDEO_ID" or just the raw 11-char ID
+            # ② MEDIA_ID field: "yt:video:VIDEO_ID"
             m = re.search(r'yt:video:([a-zA-Z0-9_-]{11})', dump)
             if m:
                 return f"https://www.youtube.com/watch?v={m.group(1)}"
@@ -279,18 +282,15 @@ def get_foreground_url() -> str | None:
 
     # ── Spotify ───────────────────────────────────────────────────────────────
     if "spotify" in pkg:
-        ms = _media_session()
         m = re.search(r'spotify:(track|episode|album|playlist|show):([a-zA-Z0-9]+)',
-                      ms)
+                      ms_dump)
         if m:
             return f"https://open.spotify.com/{m.group(1)}/{m.group(2)}"
         return None
 
     # ── Netflix ───────────────────────────────────────────────────────────────
     if "netflix" in pkg:
-        ms = _media_session()
-        # Netflix activity top usually has the content ID in the intent URI
-        m = re.search(r'netflix\.com/(?:watch|title)/(\d+)', out_t + ms)
+        m = re.search(r'netflix\.com/(?:watch|title)/(\d+)', out_t + ms_dump)
         if m:
             return f"https://www.netflix.com/watch/{m.group(1)}"
         return None

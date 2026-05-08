@@ -115,8 +115,9 @@ def _embed(child_hwnd: int, parent_hwnd: int, w: int, h: int) -> None:
     user32.SetParent(child_hwnd, parent_hwnd)
     user32.SetWindowLongW(child_hwnd, GWL_STYLE,
                           WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS)
-    ex = user32.GetWindowLongW(child_hwnd, GWL_EXSTYLE)
-    user32.SetWindowLongW(child_hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE)
+    # Do NOT set WS_EX_NOACTIVATE — it blocks SDL's SetCapture() during mouse
+    # drags, which breaks swipe gestures.  Keyboard focus is managed via
+    # explicit SetFocus() calls (Escape key + bezel click) instead.
     user32.MoveWindow(child_hwnd, 0, 0, w, h, True)
 
 
@@ -138,6 +139,7 @@ class CursorDot(QWidget):
         self._make_click_through()
 
         self._mirror_rect: QRect | None = None
+        self._scrcpy_hwnd: int = 0
         self._visible = False
 
         self._timer = QTimer(self)
@@ -147,6 +149,11 @@ class CursorDot(QWidget):
     def set_mirror_rect(self, rect: QRect | None):
         self._mirror_rect = rect
 
+    def set_scrcpy_hwnd(self, hwnd: int):
+        """Track the scrcpy SDL window handle so we can hide the dot when
+        another window is layered on top of the mirror area."""
+        self._scrcpy_hwnd = hwnd
+
     def _make_click_through(self):
         hwnd = int(self.winId())
         ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
@@ -154,18 +161,27 @@ class CursorDot(QWidget):
                               ex | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)
 
     def _tick(self):
-        if not self._mirror_rect:
+        if not self._mirror_rect or not self._scrcpy_hwnd:
             self._hide_dot()
             return
         gp = QCursor.pos()
-        if self._mirror_rect.contains(gp):
-            self.move(gp.x() - self.DOT_R - 2, gp.y() - self.DOT_R - 2)
-            if not self._visible:
-                self.show()
-                self._visible = True
-            self.update()
-        else:
+        if not self._mirror_rect.contains(gp):
             self._hide_dot()
+            return
+        # Only show the dot when the cursor is actually over the scrcpy window —
+        # not when another window (e.g. the Sprightly toolbar itself) happens to
+        # cover the same screen region.  WindowFromPoint returns the topmost
+        # visible window under the cursor, ignoring our own WS_EX_TRANSPARENT dot.
+        pt = ctypes.wintypes.POINT(gp.x(), gp.y())
+        hwnd_under = user32.WindowFromPoint(pt)
+        if hwnd_under != self._scrcpy_hwnd:
+            self._hide_dot()
+            return
+        self.move(gp.x() - self.DOT_R - 2, gp.y() - self.DOT_R - 2)
+        if not self._visible:
+            self.show()
+            self._visible = True
+        self.update()
 
     def _hide_dot(self):
         if self._visible:
@@ -267,6 +283,7 @@ class MirrorContainer(QWidget):
         self._poll_timer.stop()
         self._scrcpy_hwnd = 0
         self._dot.set_mirror_rect(None)
+        self._dot.set_scrcpy_hwnd(0)
         _middle_click_hook.set_mirror_rect(None)
         self._placeholder.show()
 
@@ -301,6 +318,7 @@ class MirrorContainer(QWidget):
         parent_hwnd = int(self.winId())
         _embed(self._scrcpy_hwnd, parent_hwnd, MIRROR_W, MIRROR_H)
         self._placeholder.hide()
+        self._dot.set_scrcpy_hwnd(self._scrcpy_hwnd)
         self._update_dot_rect()
 
     def _update_dot_rect(self):
