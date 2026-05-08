@@ -217,31 +217,59 @@ def get_foreground_url() -> str | None:
 
     pkg = ""
     if out_t:
-        m = re.search(r'^TASK\s+(\S+)', out_t, re.MULTILINE)
+        # Android 14 indents the TASK line with leading spaces — use \s* not ^
+        m = re.search(r'^\s*TASK\s+(\S+)', out_t, re.MULTILINE)
         if m:
             pkg = m.group(1).lower()
+        else:
+            # Fallback: grab package from the ACTIVITY line  e.g.
+            # "  ACTIVITY com.google.android.youtube/.HomeActivity …"
+            m = re.search(r'ACTIVITY\s+([a-z][a-zA-Z0-9_.]+)/', out_t)
+            if m:
+                pkg = m.group(1).lower()
 
+    # If pkg detection still failed, peek at the media session to infer the app
+    ms_dump = ""
     def _media_session() -> str:
-        """Lazy-load media session dump (only when needed)."""
-        rc, out, _ = _run_on_device("shell", "dumpsys", "media_session", timeout=8)
-        return out if rc == 0 else ""
+        nonlocal ms_dump
+        if not ms_dump:
+            rc, out, _ = _run_on_device("shell", "dumpsys", "media_session", timeout=8)
+            ms_dump = out if rc == 0 else ""
+        return ms_dump
+
+    # Infer package from media session when TASK/ACTIVITY parsing failed
+    if not pkg:
+        ms = _media_session()
+        for candidate in ("youtube", "spotify", "netflix", "chrome", "firefox"):
+            if candidate in ms.lower():
+                pkg = candidate
+                break
 
     # ── YouTube / YouTube Music ───────────────────────────────────────────────
     if "youtube" in pkg:
         for dump in (out_t, _media_session()):
-            # videoId=XXXXXXXXXXX in fragment arguments (internally-navigated videos)
+            # ① Best signal: thumbnail ART_URI always contains the video ID.
+            #   e.g. "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
+            m = re.search(r'i\.ytimg\.com/vi/([a-zA-Z0-9_-]{11})/', dump)
+            if m:
+                return f"https://www.youtube.com/watch?v={m.group(1)}"
+            # ② MEDIA_ID field: "yt:video:VIDEO_ID" or just the raw 11-char ID
+            m = re.search(r'yt:video:([a-zA-Z0-9_-]{11})', dump)
+            if m:
+                return f"https://www.youtube.com/watch?v={m.group(1)}"
+            # ③ videoId=XXXXXXXXXXX in fragment arguments (internally-navigated)
             m = re.search(r'[Vv]ideo[Ii]d[":\s=]+([a-zA-Z0-9_-]{11})', dump)
             if m:
                 return f"https://www.youtube.com/watch?v={m.group(1)}"
-            # Explicit watch URL
+            # ④ Explicit watch URL
             m = re.search(r'watch\?v=([a-zA-Z0-9_-]{11})', dump)
             if m:
                 return f"https://www.youtube.com/watch?v={m.group(1)}"
-            # Shorts
+            # ⑤ Shorts
             m = re.search(r'/shorts/([a-zA-Z0-9_-]{11})', dump)
             if m:
                 return f"https://www.youtube.com/shorts/{m.group(1)}"
-            # Live streams
+            # ⑥ Live streams
             m = re.search(r'youtube\.com/live/([a-zA-Z0-9_-]{11})', dump)
             if m:
                 return f"https://www.youtube.com/live/{m.group(1)}"
