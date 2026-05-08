@@ -89,20 +89,17 @@ class ScrcpyLauncher(QObject):
         ]
 
         if wifi:
-            # WiFi latency reduction strategy:
-            # • 720p instead of 1080p  → frames are ~56 % smaller (biggest win)
-            # • 1.5 Mbps bitrate       → less data per frame to transmit
-            # • 30 fps                 → halves frame rate, halves bandwidth
-            # • 0 ms buffer            → no added latency; small frames tolerate jitter
-            # --stay-awake already prevents the screen-off black-screen issue.
+            # WiFi latency reduction:
+            # • Keep resolution + fps from user settings (no quality drop)
+            # • Lower bitrate to 2M — less data per frame without visible loss
+            # • 0 ms video buffer — no added delay (--stay-awake prevents black screen)
             args += [
-                "--max-size", "720",
-                "--video-bit-rate", "1.5M",
-                "--max-fps", "30",
+                "--video-bit-rate", "2M",
+                "--max-fps", str(settings.max_fps),
                 "--video-buffer", "0",
             ]
         else:
-            # USB: use full user settings; zero buffer for real-time feel.
+            # USB: full user settings, zero buffer for real-time feel.
             args += [
                 "--video-bit-rate", settings.bitrate,
                 "--max-fps", str(settings.max_fps),

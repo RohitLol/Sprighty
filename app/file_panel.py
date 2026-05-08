@@ -23,8 +23,8 @@ import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QMimeData, QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl,
-    Signal,
+    QMimeData, QObject, QPoint, QRunnable, QSize, Qt, QThreadPool, QTimer,
+    QUrl, Signal,
 )
 from PySide6.QtGui import QDrag, QIcon, QPixmap
 from PySide6.QtWidgets import (
@@ -129,66 +129,91 @@ class _ThumbWorker(QRunnable):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _DropList(QListWidget):
-    """QListWidget that accepts drops from Windows Explorer and supports drag-out."""
+    """QListWidget that:
+    • Accepts file drops from Windows Explorer  → push to phone
+    • Lets the user drag selected files OUT     → pull to temp, hand to OS
+    """
     files_dropped = Signal(list)   # list[str] of local paths
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Accept in-bound drops from Explorer/desktop
         self.setAcceptDrops(True)
-        self.setDragEnabled(True)                            # enable drag initiation
-        self.setDragDropMode(QAbstractItemView.DragDrop)
+        # DropOnly: Qt handles incoming drops; we drive outgoing drags ourselves
+        # via mouseMoveEvent so the OS never sees a "drag while pull is blocking"
+        self.setDragDropMode(QAbstractItemView.DropOnly)
         self.setDefaultDropAction(Qt.CopyAction)
         self._cache_dir = tempfile.mkdtemp(prefix="sprightly_drag_")
-        # Callable set by parent so startDrag can update the status label
+        # Callable set by parent for status feedback during pull
         # signature: fn(msg, *, success=False, error=False)
         self.status_fn = None
+        # Track mouse press origin for manual drag detection
+        self._drag_origin: QPoint | None = None
+        self._dragging = False
+
+    # ── Inbound: PC → phone ───────────────────────────────────────────────────
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
-            super().dragEnterEvent(event)
+            event.ignore()
 
     def dragMoveEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
-            super().dragMoveEvent(event)
+            event.ignore()
 
     def dropEvent(self, event):
         if event.mimeData().hasUrls():
-            paths = []
-            for url in event.mimeData().urls():
-                local = url.toLocalFile()
-                if local and os.path.isfile(local):
-                    paths.append(local)
+            paths = [u.toLocalFile() for u in event.mimeData().urls()
+                     if u.toLocalFile() and os.path.isfile(u.toLocalFile())]
             if paths:
                 self.files_dropped.emit(paths)
             event.acceptProposedAction()
         else:
-            super().dropEvent(event)
+            event.ignore()
 
-    def startDrag(self, supported_actions):
-        """Drag selected files out to Windows Explorer / PC desktop.
+    # ── Outbound: phone → PC (manual drag detection) ──────────────────────────
 
-        Pulls each selected file from the phone to a local temp directory first,
-        then hands a file:// URL list to the OS drag engine.  The pull is
-        synchronous (blocks briefly) — a status message is shown during it.
-        """
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_origin = event.pos()
+            self._dragging = False
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_origin = None
+        self._dragging = False
+        super().mouseReleaseEvent(event)
+
+    def mouseMoveEvent(self, event):
+        # Only intercept left-button drags that haven't been handled yet
+        if (event.buttons() & Qt.LeftButton
+                and self._drag_origin is not None
+                and not self._dragging):
+            dist = (event.pos() - self._drag_origin).manhattanLength()
+            if dist >= QApplication.startDragDistance():
+                self._dragging = True
+                self._do_drag_out()
+                return   # don't pass the event on — we took over
+        super().mouseMoveEvent(event)
+
+    def _do_drag_out(self):
+        """Pull selected files from the phone and hand them to the OS drag engine."""
         items = self.selectedItems()
-        if not items:
-            return
-
         file_items = [i for i in items
                       if (e := i.data(Qt.UserRole)) and e and not e.is_dir]
         if not file_items:
-            return   # can't drag directories
+            return
 
         n = len(file_items)
         if self.status_fn:
-            self.status_fn(f"Pulling {n} file{'s' if n > 1 else ''} — please wait…")
-            QApplication.processEvents()   # let the label paint before blocking
+            self.status_fn(f"Pulling {n} file{'s' if n > 1 else ''} to cache — hold on…")
+            QApplication.processEvents()   # paint the status label before we block
 
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         local_paths = []
         for item in file_items:
             entry = item.data(Qt.UserRole)
@@ -197,6 +222,7 @@ class _DropList(QListWidget):
                 local = os.path.join(self._cache_dir, entry.name)
                 if os.path.exists(local):
                     local_paths.append(local)
+        QApplication.restoreOverrideCursor()
 
         if not local_paths:
             if self.status_fn:
@@ -204,20 +230,21 @@ class _DropList(QListWidget):
             return
 
         if self.status_fn:
-            self.status_fn(f"Drop anywhere on your PC to save {n} file{'s' if n > 1 else ''}…")
+            self.status_fn(f"Drop {n} file{'s' if n > 1 else ''} anywhere on your PC…")
+            QApplication.processEvents()
 
         mime = QMimeData()
         mime.setUrls([QUrl.fromLocalFile(p) for p in local_paths])
         drag = QDrag(self)
         drag.setMimeData(mime)
-        drag.exec(Qt.CopyAction)
+        result = drag.exec(Qt.CopyAction)   # blocks until user drops or cancels
 
         if self.status_fn:
-            self.status_fn(f"{len(self._items_text(file_items))} item(s) saved to PC")
-
-    @staticmethod
-    def _items_text(items) -> list[str]:
-        return [i.text() for i in items if i]
+            if result == Qt.CopyAction:
+                self.status_fn(f"✓ {n} file{'s' if n > 1 else ''} saved to PC", success=True)
+            else:
+                self.status_fn("Drag cancelled.")
+        self._dragging = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -458,12 +485,6 @@ class FileBrowserTab(QWidget):
 
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, e)
-            # Files are draggable to Windows Explorer; directories are not
-            base_flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
-            if not e.is_dir:
-                item.setFlags(base_flags | Qt.ItemIsDragEnabled)
-            else:
-                item.setFlags(base_flags)
             if self._view_mode == "grid":
                 item.setSizeHint(QSize(90, 100))
             self._list.addItem(item)
