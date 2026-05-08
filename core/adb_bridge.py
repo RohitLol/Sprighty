@@ -185,21 +185,36 @@ def push_clipboard_text(text: str) -> bool:
 # ── URL / activity detection ──────────────────────────────────────────────────
 
 def get_foreground_url() -> str | None:
-    """Try to extract a URL from the current foreground activity via dumpsys.
+    """Extract a playable web URL from the current foreground app.
 
-    Looks for https:// / http:// strings in the activity stack dump.
-    Most reliable when YouTube, Chrome, or a browser is in the foreground.
-    Returns the first URL found, or None.
+    Tries three strategies in order:
+    1. Activity stack intent data  — best for YouTube, Chrome, browsers
+    2. Media session metadata      — works for YouTube background play
+    3. Bare URL anywhere in dump   — broadest fallback
     """
+    # ── Strategy 1: activity intent data ──────────────────────────────────────
     rc, out, _ = _run_on_device("shell", "dumpsys", "activity", "activities",
                                  timeout=8)
-    if rc != 0 or not out:
-        return None
-    # Try intent data first — most reliable for YouTube, Chrome, browsers
-    # e.g. "dat=https://www.youtube.com/watch?v=abc123"
-    m = re.search(r'dat=(https?://[^\s"\'\\>)]+)', out)
-    if m:
-        return m.group(1).rstrip(").,;")
-    # Fallback: any URL in the dump
-    m = re.search(r'https?://[^\s"\'\\>]+', out)
-    return m.group(0).rstrip(").,;") if m else None
+    if rc == 0 and out:
+        # "dat=https://..." — the explicit intent URL (YouTube, Chrome, browser deep link)
+        m = re.search(r'dat=(https?://[^\s"\'\\>)]+)', out)
+        if m:
+            return m.group(1).rstrip(").,;")
+        # Any https URL in the dump (less specific but usually correct)
+        m = re.search(r'https?://[^\s"\'\\>]+', out)
+        if m:
+            return m.group(0).rstrip(").,;")
+
+    # ── Strategy 2: media session (YouTube background / mini-player) ──────────
+    rc2, out2, _ = _run_on_device("shell", "dumpsys", "media_session", timeout=8)
+    if rc2 == 0 and out2:
+        m = re.search(r'https?://(?:www\.youtube\.com/(?:watch|shorts|live)|youtu\.be/)'
+                      r'[^\s"\'\\>)]+', out2)
+        if m:
+            return m.group(0).rstrip(").,;")
+        # Any streaming URL in media session
+        m = re.search(r'https?://[^\s"\'\\>]+', out2)
+        if m:
+            return m.group(0).rstrip(").,;")
+
+    return None

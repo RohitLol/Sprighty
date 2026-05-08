@@ -46,6 +46,11 @@ class MainWindow(QMainWindow):
         self._auto_refresh_timer = QTimer(self)
         self._auto_refresh_timer.timeout.connect(self._file_panel_auto_refresh)
         self._auto_refresh_timer.setInterval(30_000)  # 30 s
+        # Debounce file-list refresh: a WiFi device may reconnect several times
+        # in quick succession; we only want one refresh at the end, not one per event.
+        self._file_refresh_debounce = QTimer(self)
+        self._file_refresh_debounce.setSingleShot(True)
+        self._file_refresh_debounce.setInterval(3000)   # wait 3 s after last event
 
         self._setup_ui()
         self._setup_tray()
@@ -199,6 +204,7 @@ class MainWindow(QMainWindow):
         self._device_manager.device_added.connect(self._on_device_added)
         self._device_manager.device_removed.connect(self._on_device_removed)
         self._device_manager.device_state_changed.connect(self._on_device_state_changed)
+        self._file_refresh_debounce.timeout.connect(self._file_panel.refresh_files)
 
         self._device_combo.currentIndexChanged.connect(self._on_combo_changed)
 
@@ -270,7 +276,9 @@ class MainWindow(QMainWindow):
         self._devices[device.serial] = device
         self._rebuild_combo()
         adb_bridge.set_target(device.serial)
-        QTimer.singleShot(800, self._file_panel.refresh_files)
+        # Debounce: rapid WiFi reconnects restart the timer; only ONE refresh fires
+        # 3 s after the last device_added event — prevents constant loading spinner.
+        self._file_refresh_debounce.start()
         self._auto_refresh_timer.start()
         self._tray.showMessage("Sprightly", f"{device.display_name} connected",
                                QSystemTrayIcon.Information, 2000)
@@ -434,9 +442,11 @@ class MainWindow(QMainWindow):
 
     def _send_to_browser(self):
         if self._mirroring_serial:
+            # Send KEYCODE_COPY to phone, then wait 800 ms for scrcpy to sync
+            # the clipboard back to the PC (400 ms was too short over WiFi).
             run_async(lambda: adb_bridge.keyevent(278),
                       on_done=lambda _: QTimer.singleShot(
-                          400, self._open_url_from_clipboard_or_dumpsys))
+                          800, self._open_url_from_clipboard_or_dumpsys))
         else:
             self._open_url_from_clipboard_or_dumpsys()
 

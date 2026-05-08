@@ -89,16 +89,20 @@ class ScrcpyLauncher(QObject):
         ]
 
         if wifi:
-            # WiFi: cap at 30 fps and 2 Mbps to reduce network load and latency.
-            # 50 ms video buffer smooths WiFi jitter without noticeable lag
-            # (previous 200 ms made the mirror feel sluggish).
+            # WiFi latency reduction strategy:
+            # • 720p instead of 1080p  → frames are ~56 % smaller (biggest win)
+            # • 1.5 Mbps bitrate       → less data per frame to transmit
+            # • 30 fps                 → halves frame rate, halves bandwidth
+            # • 0 ms buffer            → no added latency; small frames tolerate jitter
+            # --stay-awake already prevents the screen-off black-screen issue.
             args += [
-                "--video-bit-rate", "2M",
+                "--max-size", "720",
+                "--video-bit-rate", "1.5M",
                 "--max-fps", "30",
-                "--video-buffer", "50",
+                "--video-buffer", "0",
             ]
         else:
-            # USB: use full user settings and zero buffering for real-time feel.
+            # USB: use full user settings; zero buffer for real-time feel.
             args += [
                 "--video-bit-rate", settings.bitrate,
                 "--max-fps", str(settings.max_fps),

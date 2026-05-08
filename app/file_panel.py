@@ -135,9 +135,13 @@ class _DropList(QListWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
+        self.setDragEnabled(True)                            # enable drag initiation
         self.setDragDropMode(QAbstractItemView.DragDrop)
         self.setDefaultDropAction(Qt.CopyAction)
         self._cache_dir = tempfile.mkdtemp(prefix="sprightly_drag_")
+        # Callable set by parent so startDrag can update the status label
+        # signature: fn(msg, *, success=False, error=False)
+        self.status_fn = None
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -165,26 +169,55 @@ class _DropList(QListWidget):
             super().dropEvent(event)
 
     def startDrag(self, supported_actions):
-        """Drag selected files out to Windows Explorer (pulls to temp first)."""
+        """Drag selected files out to Windows Explorer / PC desktop.
+
+        Pulls each selected file from the phone to a local temp directory first,
+        then hands a file:// URL list to the OS drag engine.  The pull is
+        synchronous (blocks briefly) — a status message is shown during it.
+        """
         items = self.selectedItems()
         if not items:
             return
+
+        file_items = [i for i in items
+                      if (e := i.data(Qt.UserRole)) and e and not e.is_dir]
+        if not file_items:
+            return   # can't drag directories
+
+        n = len(file_items)
+        if self.status_fn:
+            self.status_fn(f"Pulling {n} file{'s' if n > 1 else ''} — please wait…")
+            QApplication.processEvents()   # let the label paint before blocking
+
         local_paths = []
-        for item in items:
+        for item in file_items:
             entry = item.data(Qt.UserRole)
-            if entry and not entry.is_dir:
-                ok, _ = adb_files.pull_file(entry.path, self._cache_dir)
-                if ok:
-                    local = os.path.join(self._cache_dir, entry.name)
-                    if os.path.exists(local):
-                        local_paths.append(local)
+            ok, _ = adb_files.pull_file(entry.path, self._cache_dir)
+            if ok:
+                local = os.path.join(self._cache_dir, entry.name)
+                if os.path.exists(local):
+                    local_paths.append(local)
+
         if not local_paths:
+            if self.status_fn:
+                self.status_fn("Drag failed — check device connection.", error=True)
             return
+
+        if self.status_fn:
+            self.status_fn(f"Drop anywhere on your PC to save {n} file{'s' if n > 1 else ''}…")
+
         mime = QMimeData()
         mime.setUrls([QUrl.fromLocalFile(p) for p in local_paths])
         drag = QDrag(self)
         drag.setMimeData(mime)
         drag.exec(Qt.CopyAction)
+
+        if self.status_fn:
+            self.status_fn(f"{len(self._items_text(file_items))} item(s) saved to PC")
+
+    @staticmethod
+    def _items_text(items) -> list[str]:
+        return [i.text() for i in items if i]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,6 +326,8 @@ class FileBrowserTab(QWidget):
         self._list.itemDoubleClicked.connect(self._on_double_click)
         self._list.files_dropped.connect(self._on_files_dropped)
         self._list.itemSelectionChanged.connect(self._update_pull_btn)
+        # Let startDrag update our status label during the pull phase
+        self._list.status_fn = self._set_status
         lay.addWidget(self._list)
 
         # Drop hint overlay label
@@ -423,6 +458,12 @@ class FileBrowserTab(QWidget):
 
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, e)
+            # Files are draggable to Windows Explorer; directories are not
+            base_flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+            if not e.is_dir:
+                item.setFlags(base_flags | Qt.ItemIsDragEnabled)
+            else:
+                item.setFlags(base_flags)
             if self._view_mode == "grid":
                 item.setSizeHint(QSize(90, 100))
             self._list.addItem(item)
