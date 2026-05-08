@@ -191,39 +191,103 @@ def push_clipboard_text(text: str) -> bool:
     return rc == 0
 
 
-# ── URL / activity detection ──────────────────────────────────────────────────
+# ── URL / media detection ─────────────────────────────────────────────────────
 
 def get_foreground_url() -> str | None:
-    """Extract a playable web URL from the current foreground app.
+    """Return the URL of whatever media/page is active in the foreground app.
 
-    Tries three strategies in order:
-    1. Activity stack intent data  — best for YouTube, Chrome, browsers
-    2. Media session metadata      — works for YouTube background play
-    3. Bare URL anywhere in dump   — broadest fallback
+    Unlike a generic URL search, this is foreground-aware:
+    • detects which app is visible via ``dumpsys activity top``
+    • runs app-specific extraction so a background Reddit tab never
+      contaminates a YouTube result (the old bug)
+
+    Supported apps
+    --------------
+    YouTube / YT Music  — video ID from activity arguments or media session
+    Spotify             — spotify:…:ID URI  →  open.spotify.com URL
+    Browser             — intent dat= URL from the current task
+    Any other app       — falls back to any https URL in the activity dump
     """
-    # ── Strategy 1: activity intent data ──────────────────────────────────────
-    rc, out, _ = _run_on_device("shell", "dumpsys", "activity", "activities",
-                                 timeout=8)
-    if rc == 0 and out:
-        # "dat=https://..." — the explicit intent URL (YouTube, Chrome, browser deep link)
-        m = re.search(r'dat=(https?://[^\s"\'\\>)]+)', out)
+    # ── Step 1: foreground activity dump ─────────────────────────────────────
+    # ``dumpsys activity top`` shows ONLY the currently visible task/activity.
+    # The first TASK line tells us the package; the rest may contain the URL.
+    rc_t, out_t, _ = _run_on_device("shell", "dumpsys", "activity", "top",
+                                     timeout=8)
+    out_t = out_t if rc_t == 0 else ""
+
+    pkg = ""
+    if out_t:
+        m = re.search(r'^TASK\s+(\S+)', out_t, re.MULTILINE)
+        if m:
+            pkg = m.group(1).lower()
+
+    def _media_session() -> str:
+        """Lazy-load media session dump (only when needed)."""
+        rc, out, _ = _run_on_device("shell", "dumpsys", "media_session", timeout=8)
+        return out if rc == 0 else ""
+
+    # ── YouTube / YouTube Music ───────────────────────────────────────────────
+    if "youtube" in pkg:
+        for dump in (out_t, _media_session()):
+            # videoId=XXXXXXXXXXX in fragment arguments (internally-navigated videos)
+            m = re.search(r'[Vv]ideo[Ii]d[":\s=]+([a-zA-Z0-9_-]{11})', dump)
+            if m:
+                return f"https://www.youtube.com/watch?v={m.group(1)}"
+            # Explicit watch URL
+            m = re.search(r'watch\?v=([a-zA-Z0-9_-]{11})', dump)
+            if m:
+                return f"https://www.youtube.com/watch?v={m.group(1)}"
+            # Shorts
+            m = re.search(r'/shorts/([a-zA-Z0-9_-]{11})', dump)
+            if m:
+                return f"https://www.youtube.com/shorts/{m.group(1)}"
+            # Live streams
+            m = re.search(r'youtube\.com/live/([a-zA-Z0-9_-]{11})', dump)
+            if m:
+                return f"https://www.youtube.com/live/{m.group(1)}"
+        # YouTube is open but we couldn't identify the video — stop here.
+        # Do NOT fall through: we'd return a stale URL from a background app.
+        return None
+
+    # ── Spotify ───────────────────────────────────────────────────────────────
+    if "spotify" in pkg:
+        ms = _media_session()
+        m = re.search(r'spotify:(track|episode|album|playlist|show):([a-zA-Z0-9]+)',
+                      ms)
+        if m:
+            return f"https://open.spotify.com/{m.group(1)}/{m.group(2)}"
+        return None
+
+    # ── Netflix ───────────────────────────────────────────────────────────────
+    if "netflix" in pkg:
+        ms = _media_session()
+        # Netflix activity top usually has the content ID in the intent URI
+        m = re.search(r'netflix\.com/(?:watch|title)/(\d+)', out_t + ms)
+        if m:
+            return f"https://www.netflix.com/watch/{m.group(1)}"
+        return None
+
+    # ── Browser (Chrome, Firefox, Edge, Samsung Internet …) ──────────────────
+    _BROWSERS = ("chrome", "firefox", "edge", "samsung", "brave", "opera",
+                 "vivaldi", "browser")
+    if any(b in pkg for b in _BROWSERS):
+        # dat= is the reliable source for browser current-tab URLs
+        m = re.search(r'dat=(https?://[^\s"\'\\>)]+)', out_t)
         if m:
             return m.group(1).rstrip(").,;")
-        # Any https URL in the dump (less specific but usually correct)
-        m = re.search(r'https?://[^\s"\'\\>]+', out)
+        # Broader scan of the top-activity dump (some browsers store URL differently)
+        m = re.search(r'https?://(?!localhost)[^\s"\'\\>)]+', out_t)
         if m:
             return m.group(0).rstrip(").,;")
+        return None
 
-    # ── Strategy 2: media session (YouTube background / mini-player) ──────────
-    rc2, out2, _ = _run_on_device("shell", "dumpsys", "media_session", timeout=8)
-    if rc2 == 0 and out2:
-        m = re.search(r'https?://(?:www\.youtube\.com/(?:watch|shorts|live)|youtu\.be/)'
-                      r'[^\s"\'\\>)]+', out2)
-        if m:
-            return m.group(0).rstrip(").,;")
-        # Any streaming URL in media session
-        m = re.search(r'https?://[^\s"\'\\>]+', out2)
-        if m:
-            return m.group(0).rstrip(").,;")
+    # ── Generic fallback (unknown app) ────────────────────────────────────────
+    # Only the TOP activity is searched — avoids picking up stale background URLs.
+    m = re.search(r'dat=(https?://[^\s"\'\\>)]+)', out_t)
+    if m:
+        return m.group(1).rstrip(").,;")
+    m = re.search(r'https?://(?!localhost)[^\s"\'\\>)]+', out_t)
+    if m:
+        return m.group(0).rstrip(").,;")
 
     return None

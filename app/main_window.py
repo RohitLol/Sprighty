@@ -1,6 +1,6 @@
 import webbrowser
 
-from PySide6.QtCore import Qt, QSize, QTimer
+from PySide6.QtCore import Qt, QSize, QTimer, QEvent
 from PySide6.QtGui import QAction, QCloseEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -131,8 +131,10 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
 
         # ── Share / clipboard ─────────────────────────────────────────────────
-        act_browser = QAction(icon("send_url"), "Send URL", self)
-        act_browser.setToolTip("Send the phone's current URL to your PC browser")
+        act_browser = QAction(icon("send_url"), "Send Media", self)
+        act_browser.setToolTip(
+            "Open what's playing on the phone in your PC browser\n"
+            "(YouTube video, Spotify track, Chrome tab…)")
         act_browser.triggered.connect(self._send_to_browser)
         tb.addAction(act_browser)
 
@@ -268,8 +270,12 @@ class MainWindow(QMainWindow):
         self._act_panel.setChecked(not visible)
 
     def _file_panel_auto_refresh(self):
-        """Auto-refresh file list every 30s while a device is connected."""
-        if self._devices:
+        """Auto-refresh file list every 30s — skipped during active mirror.
+
+        Running 'adb shell ls -la' over the same WiFi link that carries the
+        video stream competes for bandwidth and causes brief stutter.
+        """
+        if self._devices and not self._mirroring_serial:
             self._file_panel.refresh_files()
 
     def _on_device_added(self, device: Device):
@@ -441,31 +447,50 @@ class MainWindow(QMainWindow):
     # ── Send to browser ───────────────────────────────────────────────────────
 
     def _send_to_browser(self):
-        if self._mirroring_serial:
-            # Send KEYCODE_COPY to phone, then wait 800 ms for scrcpy to sync
-            # the clipboard back to the PC (400 ms was too short over WiFi).
-            run_async(lambda: adb_bridge.keyevent(278),
-                      on_done=lambda _: QTimer.singleShot(
-                          800, self._open_url_from_clipboard_or_dumpsys))
-        else:
-            self._open_url_from_clipboard_or_dumpsys()
+        """Open whatever is playing/showing on the phone in the PC browser.
 
-    def _open_url_from_clipboard_or_dumpsys(self):
+        Checks the PC clipboard first (in case scrcpy already synced a copied
+        link), then runs foreground-aware ADB extraction for YouTube, Spotify,
+        Chrome, etc.
+        """
         clip = QApplication.clipboard().text().strip()
-        if clip.startswith("http://") or clip.startswith("https://"):
+        if clip.startswith(("http://", "https://")):
             webbrowser.open(clip)
             self._status.showMessage(f"Opened in browser: {clip[:80]}")
             return
-        self._status.showMessage("Searching for URL on phone…")
+        self._status.showMessage("Detecting what's playing on phone…")
         run_async(adb_bridge.get_foreground_url, on_done=self._on_url_found)
 
     def _on_url_found(self, url):
         if url:
             webbrowser.open(url)
-            self._status.showMessage(f"Opened in browser: {url[:80]}")
+            # Show a friendly label based on the URL
+            if "youtube.com" in url or "youtu.be" in url:
+                label = "YouTube video"
+            elif "spotify.com" in url:
+                label = "Spotify track"
+            elif "netflix.com" in url:
+                label = "Netflix title"
+            else:
+                label = url[:70]
+            self._status.showMessage(f"✓ Opened {label} in browser")
         else:
             self._status.showMessage(
-                "No URL found. Copy a link on the phone first, then click Send URL.")
+                "Could not detect media — make sure YouTube/Spotify/Chrome "
+                "is in the foreground and a video or track is playing.")
+
+    def _focus_mirror(self):
+        """Return keyboard focus to the embedded scrcpy window."""
+        if self._launcher.is_running:
+            self._mirror.request_scrcpy_focus()
+
+    def keyPressEvent(self, event):
+        """Press Escape while mirroring → return keyboard focus to scrcpy."""
+        if event.key() == Qt.Key_Escape and self._mirroring_serial:
+            self._focus_mirror()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _show_window(self):
         self.showNormal()

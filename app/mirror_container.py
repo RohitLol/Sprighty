@@ -237,6 +237,22 @@ class MirrorContainer(QWidget):
 
     # ── public ────────────────────────────────────────────────────────────────
 
+    @property
+    def scrcpy_hwnd(self) -> int:
+        return self._scrcpy_hwnd
+
+    def request_scrcpy_focus(self) -> bool:
+        """Give keyboard focus to the embedded scrcpy window.
+
+        Call this after any UI interaction that may have stolen Win32 focus
+        (toolbar clicks, file-panel, etc.) so keyboard input flows to scrcpy again.
+        Returns True if the HWND was found and focused.
+        """
+        if self._scrcpy_hwnd:
+            user32.SetFocus(self._scrcpy_hwnd)
+            return True
+        return False
+
     def set_middle_click_callback(self, cb) -> None:
         _middle_click_hook.set_callback(cb)
 
@@ -336,6 +352,13 @@ class PhoneFrame(QWidget):
 
     # ── Proxy API ─────────────────────────────────────────────────────────────
 
+    @property
+    def scrcpy_hwnd(self) -> int:
+        return self._mirror.scrcpy_hwnd
+
+    def request_scrcpy_focus(self) -> bool:
+        return self._mirror.request_scrcpy_focus()
+
     def set_middle_click_callback(self, cb) -> None:
         self._mirror.set_middle_click_callback(cb)
 
@@ -347,6 +370,11 @@ class PhoneFrame(QWidget):
 
     def cleanup(self) -> None:
         self._mirror.cleanup()
+
+    def mousePressEvent(self, event):
+        """Clicking anywhere on the phone body (bezels included) refocuses scrcpy."""
+        self._mirror.request_scrcpy_focus()
+        super().mousePressEvent(event)
 
     # ── Paint ─────────────────────────────────────────────────────────────────
 
