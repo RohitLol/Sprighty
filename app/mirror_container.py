@@ -21,13 +21,8 @@ WS_EX_NOACTIVATE  = 0x08000000
 
 # Windows hook constants
 WH_MOUSE_LL    = 14
-WH_KEYBOARD_LL = 13
 WM_MBUTTONDOWN = 0x0207
 WM_MOUSEWHEEL  = 0x020A
-WM_KEYDOWN     = 0x0100
-WM_SYSKEYDOWN  = 0x0104
-VK_LEFT        = 0x25
-VK_RIGHT       = 0x26
 VK_SHIFT       = 0x10
 
 # ── 64-bit–safe ctypes aliases ─────────────────────────────────────────────────
@@ -41,22 +36,21 @@ user32.CallNextHookEx.argtypes    = [ctypes.wintypes.HHOOK,
                                      ctypes.c_int, _WPARAM, _LPARAM]
 user32.UnhookWindowsHookEx.argtypes = [ctypes.wintypes.HHOOK]
 
+# AttachThreadInput lets SetFocus work across process boundaries.
+_kernel32 = ctypes.windll.kernel32
+user32.GetWindowThreadProcessId.restype  = ctypes.wintypes.DWORD
+user32.GetWindowThreadProcessId.argtypes = [
+    ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.DWORD)]
+user32.AttachThreadInput.restype  = ctypes.wintypes.BOOL
+user32.AttachThreadInput.argtypes = [
+    ctypes.wintypes.DWORD, ctypes.wintypes.DWORD, ctypes.wintypes.BOOL]
+
 # ── Windows low-level mouse hook ───────────────────────────────────────────────
 
 class _MSLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [
         ("pt",          ctypes.wintypes.POINT),
         ("mouseData",   ctypes.wintypes.DWORD),
-        ("flags",       ctypes.wintypes.DWORD),
-        ("time",        ctypes.wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_size_t),
-    ]
-
-
-class _KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("vkCode",      ctypes.wintypes.DWORD),
-        ("scanCode",    ctypes.wintypes.DWORD),
         ("flags",       ctypes.wintypes.DWORD),
         ("time",        ctypes.wintypes.DWORD),
         ("dwExtraInfo", ctypes.c_size_t),
@@ -115,17 +109,15 @@ class _MiddleClickHook:
                             info = ctypes.cast(
                                 lParam, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
                             if rect.contains(info.pt.x, info.pt.y):
+                                delta = ctypes.c_int16(info.mouseData >> 16).value
                                 shift = bool(
                                     user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
                                 if shift:
-                                    # High word of mouseData = signed wheel delta
-                                    delta = ctypes.c_int16(
-                                        info.mouseData >> 16).value
-                                    if delta > 0 and self._swipe_left_cb:
-                                        self._swipe_left_cb()   # up = next
-                                    elif delta < 0 and self._swipe_right_cb:
-                                        self._swipe_right_cb()  # down = prev
-                                    return 1   # block from reaching scrcpy
+                                    if delta > 0 and self._swipe_right_cb:
+                                        self._swipe_right_cb()
+                                    elif delta < 0 and self._swipe_left_cb:
+                                        self._swipe_left_cb()
+                                    return 1
                         except Exception:
                             pass
             return user32.CallNextHookEx(self._hook_id, nCode, wParam, lParam)
@@ -141,73 +133,7 @@ class _MiddleClickHook:
             self._hook_id = None
 
 
-class _KeyboardSwipeHook:
-    """System-wide WH_KEYBOARD_LL hook.
-
-    Intercepts Shift + Left / Shift + Right **when the cursor is inside the
-    mirror rectangle** and converts them to horizontal swipe callbacks.
-    All other keystrokes pass through unchanged.
-
-    Cursor-in-rect guard prevents accidental interception while the user is
-    working in another application.
-    """
-
-    def __init__(self):
-        self._hook_id        = None
-        self._proc_ref       = None
-        self._mirror_rect: QRect | None = None
-        self._swipe_left_cb  = None   # Shift+Right → next item
-        self._swipe_right_cb = None   # Shift+Left  → prev item
-
-    def set_mirror_rect(self, rect: QRect | None) -> None:
-        self._mirror_rect = rect
-
-    def set_callbacks(self, left_cb, right_cb) -> None:
-        self._swipe_left_cb  = left_cb
-        self._swipe_right_cb = right_cb
-
-    def install(self) -> None:
-        if self._hook_id:
-            return
-
-        def _proc(nCode: int, wParam: int, lParam: int) -> int:
-            if nCode >= 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                rect = self._mirror_rect
-                if rect:
-                    try:
-                        info = ctypes.cast(
-                            lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
-                        vk = info.vkCode
-                        if vk in (VK_LEFT, VK_RIGHT):
-                            # Only intercept when cursor is over the mirror
-                            pt = ctypes.wintypes.POINT()
-                            user32.GetCursorPos(ctypes.byref(pt))
-                            if rect.contains(pt.x, pt.y):
-                                shift = bool(
-                                    user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
-                                if shift:
-                                    if vk == VK_RIGHT and self._swipe_left_cb:
-                                        self._swipe_left_cb()   # → next item
-                                    elif vk == VK_LEFT and self._swipe_right_cb:
-                                        self._swipe_right_cb()  # ← prev item
-                                    return 1   # block keystroke from scrcpy
-                    except Exception:
-                        pass
-            return user32.CallNextHookEx(self._hook_id, nCode, wParam, lParam)
-
-        self._proc_ref = _HookProc(_proc)
-        self._hook_id  = user32.SetWindowsHookExW(
-            WH_KEYBOARD_LL, self._proc_ref, None, 0
-        )
-
-    def uninstall(self) -> None:
-        if self._hook_id:
-            user32.UnhookWindowsHookEx(self._hook_id)
-            self._hook_id = None
-
-
-_middle_click_hook   = _MiddleClickHook()
-_keyboard_swipe_hook = _KeyboardSwipeHook()
+_middle_click_hook = _MiddleClickHook()
 
 # ── Screen dimensions (Pixel 8a 9:20 portrait) ────────────────────────────────
 MIRROR_W = 360
@@ -364,8 +290,14 @@ class MirrorContainer(QWidget):
 
         self._dot = CursorDot()
 
+        # Refresh the hook rect every 500 ms so it stays accurate when the
+        # main window is moved or resized (moveEvent only fires on *this* widget,
+        # not on ancestor windows).
+        self._rect_refresh_timer = QTimer(self)
+        self._rect_refresh_timer.timeout.connect(self._update_dot_rect)
+        self._rect_refresh_timer.start(500)
+
         _middle_click_hook.install()
-        _keyboard_swipe_hook.install()
 
     # ── public ────────────────────────────────────────────────────────────────
 
@@ -376,32 +308,28 @@ class MirrorContainer(QWidget):
     def request_scrcpy_focus(self) -> bool:
         """Give keyboard focus to the embedded scrcpy window.
 
-        Call this after any UI interaction that may have stolen Win32 focus
-        (toolbar clicks, file-panel, etc.) so keyboard input flows to scrcpy again.
-        Returns True if the HWND was found and focused.
+        Uses AttachThreadInput so SetFocus works across the process boundary
+        between Qt (our process) and scrcpy (separate process/thread).
+        Returns True if the HWND was found and the focus call was issued.
         """
-        if self._scrcpy_hwnd:
-            user32.SetFocus(self._scrcpy_hwnd)
-            return True
-        return False
+        if not self._scrcpy_hwnd:
+            return False
+        tid_target = user32.GetWindowThreadProcessId(self._scrcpy_hwnd, None)
+        tid_self   = _kernel32.GetCurrentThreadId()
+        attached   = False
+        if tid_target and tid_target != tid_self:
+            attached = bool(user32.AttachThreadInput(tid_self, tid_target, True))
+        user32.SetFocus(self._scrcpy_hwnd)
+        if attached:
+            user32.AttachThreadInput(tid_self, tid_target, False)
+        return True
 
     def set_middle_click_callback(self, cb) -> None:
         _middle_click_hook.set_callback(cb)
 
     def set_swipe_callbacks(self, left_cb, right_cb) -> None:
-        """Register callbacks for horizontal swipe gestures.
-
-        ``left_cb``  is called to swipe left  (next carousel item / scroll right).
-        ``right_cb`` is called to swipe right (prev carousel item / scroll left).
-
-        Triggered by:
-        • Shift + Right Arrow   (cursor over mirror) → left_cb
-        • Shift + Left Arrow    (cursor over mirror) → right_cb
-        • Shift + Scroll Up     (cursor over mirror) → left_cb
-        • Shift + Scroll Down   (cursor over mirror) → right_cb
-        """
+        """Register callbacks for Shift+Scroll horizontal swipe gestures."""
         _middle_click_hook.set_swipe_callbacks(left_cb, right_cb)
-        _keyboard_swipe_hook.set_callbacks(left_cb, right_cb)
 
     def start_embedding(self, window_title: str):
         self._search_title = window_title
@@ -416,13 +344,12 @@ class MirrorContainer(QWidget):
         self._dot.set_mirror_rect(None)
         self._dot.set_scrcpy_hwnd(0)
         _middle_click_hook.set_mirror_rect(None)
-        _keyboard_swipe_hook.set_mirror_rect(None)
         self._placeholder.show()
 
     def cleanup(self):
         """Uninstall global hooks and close the cursor dot overlay."""
+        self._rect_refresh_timer.stop()
         _middle_click_hook.uninstall()
-        _keyboard_swipe_hook.uninstall()
         self._dot.close()
 
     # ── internal ──────────────────────────────────────────────────────────────
@@ -455,11 +382,12 @@ class MirrorContainer(QWidget):
         self._update_dot_rect()
 
     def _update_dot_rect(self):
+        if not self.isVisible():
+            return
         tl = self.mapToGlobal(QPoint(0, 0))
         rect = QRect(tl.x(), tl.y(), MIRROR_W, MIRROR_H)
         self._dot.set_mirror_rect(rect)
         _middle_click_hook.set_mirror_rect(rect)
-        _keyboard_swipe_hook.set_mirror_rect(rect)
 
     def moveEvent(self, event):
         super().moveEvent(event)
@@ -469,7 +397,6 @@ class MirrorContainer(QWidget):
         super().hideEvent(event)
         self._dot.set_mirror_rect(None)
         _middle_click_hook.set_mirror_rect(None)
-        _keyboard_swipe_hook.set_mirror_rect(None)
 
 
 # ── Phone body frame ───────────────────────────────────────────────────────────

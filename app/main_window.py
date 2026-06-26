@@ -1,3 +1,5 @@
+import os
+import subprocess
 import webbrowser
 
 from PySide6.QtCore import Qt, QSize, QTimer, QEvent
@@ -5,10 +7,12 @@ from PySide6.QtGui import QAction, QCloseEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPushButton,
     QSizePolicy,
     QSplitter,
     QStatusBar,
@@ -26,9 +30,9 @@ from app.usb_dialog import UsbDialog
 from core import adb_bridge
 from core.device_manager import DeviceManager
 from core.scrcpy_launcher import ScrcpyLauncher
-from core.settings_store import load_paired_devices, load_window_geometry, save_window_geometry
+from core.settings_store import load_paired_devices, load_scrcpy_settings, load_window_geometry, save_window_geometry
 from core.worker import run_async
-from models.device import Device, DeviceState
+from models.device import Device, DeviceState, Transport
 from utils.icon_loader import icon
 from utils.vendor_paths import scrcpy_dir, validate
 
@@ -43,6 +47,7 @@ class MainWindow(QMainWindow):
         self._device_manager = DeviceManager(self)
         self._devices: dict[str, Device] = {}
         self._mirroring_serial: str | None = None
+        self._best_quality: bool = False
         self._auto_refresh_timer = QTimer(self)
         self._auto_refresh_timer.timeout.connect(self._file_panel_auto_refresh)
         self._auto_refresh_timer.setInterval(30_000)  # 30 s
@@ -167,6 +172,37 @@ class MainWindow(QMainWindow):
 
         self._mirror = PhoneFrame()
         lv.addWidget(self._mirror, 0, Qt.AlignHCenter | Qt.AlignTop)
+
+        # ── Mirror quality toggle ──────────────────────────────────────────────
+        quality_bar = QWidget()
+        quality_bar.setStyleSheet("background:transparent;")
+        ql = QHBoxLayout(quality_bar)
+        ql.setContentsMargins(0, 8, 0, 0)
+        ql.setSpacing(2)
+
+        _btn_style_off = (
+            "QPushButton{background:#111118;color:#44445A;border:1px solid #222230;"
+            "border-radius:4px;padding:3px 14px;font-size:11px;font-weight:500;}"
+            "QPushButton:hover{background:#1A1A28;color:#6666AA;}"
+        )
+        _btn_style_on = (
+            "QPushButton{background:#2A2A60;color:#AAAAFF;border:1px solid #4444AA;"
+            "border-radius:4px;padding:3px 14px;font-size:11px;font-weight:600;}"
+        )
+
+        self._btn_q_normal = QPushButton("Normal")
+        self._btn_q_best   = QPushButton("Best")
+        self._btn_q_normal.setStyleSheet(_btn_style_on)
+        self._btn_q_best.setStyleSheet(_btn_style_off)
+        self._btn_q_normal.clicked.connect(lambda: self._set_quality(False))
+        self._btn_q_best.clicked.connect(lambda: self._set_quality(True))
+
+        ql.addStretch()
+        ql.addWidget(self._btn_q_normal)
+        ql.addWidget(self._btn_q_best)
+        ql.addStretch()
+
+        lv.addWidget(quality_bar, 0, Qt.AlignHCenter)
         lv.addStretch()
 
         splitter.addWidget(left_wrap)
@@ -246,8 +282,11 @@ class MainWindow(QMainWindow):
         self._status.showMessage("Ready — connect a device to begin.")
 
     def _reconnect_saved_devices(self):
+        seen_ips: set[str] = set()
         for saved in load_paired_devices():
-            run_async(self._reconnect_one, saved.ip, saved.port)
+            if saved.ip not in seen_ips:      # one reconnect attempt per IP
+                seen_ips.add(saved.ip)
+                run_async(self._reconnect_one, saved.ip, saved.port)
 
     def _reconnect_one(self, ip: str, port: int):
         """Try saved port; fall back to port auto-detect if it fails."""
@@ -322,11 +361,35 @@ class MainWindow(QMainWindow):
             DeviceState.OFFLINE: "○",
         }.get(device.state, "○")
 
+    @staticmethod
+    def _usb_serial_from_mdns(serial: str) -> str:
+        """Extract the USB serial embedded in a mDNS ADB serial.
+
+        mDNS serials look like: adb-R3CX20YK8BX-XXXXX._adb-tls-connect._tcp.local:PORT
+        Returns the USB serial portion, or "" if this isn't a mDNS serial.
+        """
+        import re as _re
+        m = _re.match(r'adb-([A-Za-z0-9]+)', serial)
+        return m.group(1) if m else ""
+
     def _rebuild_combo(self):
         self._device_combo.blockSignals(True)
         prev = self._device_combo.currentData()
         self._device_combo.clear()
+
+        # USB serials currently connected — used to suppress mDNS duplicates.
+        usb_serials = {d.serial for d in self._devices.values()
+                       if d.transport == Transport.USB}
+
         for d in self._devices.values():
+            # Skip a mDNS WiFi entry when the same physical device is already
+            # listed via its USB cable (avoids "Pixel 8a · USB" + "Pixel 8a (WiFi)"
+            # for the exact same device).
+            if d.transport == Transport.TCPIP:
+                usb_part = self._usb_serial_from_mdns(d.serial)
+                if usb_part and usb_part in usb_serials:
+                    continue
+
             tag = self._transport_tag(d)
             dot = self._state_dot(d)
             label = f"{dot}  {d.display_name}  ·  {tag}  ·  {d.state.value}"
@@ -354,6 +417,7 @@ class MainWindow(QMainWindow):
         else:
             self._btn_mirror.setIcon(icon("play"))
             self._btn_mirror.setText("Mirror")
+        self._update_quality_bar()
 
     def _selected_device(self) -> Device | None:
         serial = self._device_combo.currentData()
@@ -361,13 +425,51 @@ class MainWindow(QMainWindow):
 
     # ── Mirror actions ────────────────────────────────────────────────────────
 
+    _Q_ON  = ("QPushButton{background:#2A2A60;color:#AAAAFF;border:1px solid #4444AA;"
+              "border-radius:4px;padding:3px 14px;font-size:11px;font-weight:600;}")
+    _Q_OFF = ("QPushButton{background:#111118;color:#44445A;border:1px solid #222230;"
+              "border-radius:4px;padding:3px 14px;font-size:11px;font-weight:500;}"
+              "QPushButton:hover{background:#1A1A28;color:#6666AA;}")
+
+    def _set_quality(self, best: bool) -> None:
+        if self._best_quality == best:
+            return
+        self._best_quality = best
+        self._btn_q_normal.setStyleSheet(self._Q_ON  if not best else self._Q_OFF)
+        self._btn_q_best.setStyleSheet(  self._Q_ON  if best  else self._Q_OFF)
+        # If currently mirroring over WiFi, stop and restart with new quality
+        if self._mirroring_serial is not None:
+            device = self._selected_device()
+            if device and device.transport == Transport.TCPIP:
+                self._launcher.stop()
+                QTimer.singleShot(800, self._toggle_mirror)
+
+    def _update_quality_bar(self) -> None:
+        """Show/hide quality toggle based on selected device transport."""
+        device = self._selected_device()
+        is_wifi = device is not None and device.transport == Transport.TCPIP
+        # Always enabled — changing while mirroring triggers an auto-restart
+        self._btn_q_normal.setVisible(is_wifi)
+        self._btn_q_best.setVisible(is_wifi)
+
     def _toggle_mirror(self):
         if self._mirroring_serial:
             self._launcher.stop()
         else:
             device = self._selected_device()
             if device and device.is_connectable:
-                self._launcher.start(device)
+                settings = load_scrcpy_settings()
+                if device.transport == Transport.USB:
+                    # USB: 1080p, 8M bitrate, 60fps — best quality, zero lag
+                    settings.max_size = 1080
+                    settings.bitrate  = "8M"
+                    settings.max_fps  = 60
+                elif self._best_quality:
+                    # WiFi Best: match USB quality
+                    settings.wifi_max_fps  = 60
+                    settings.wifi_max_size = 1080
+                    settings.wifi_bitrate  = "4M"
+                self._launcher.start(device, settings)
 
     def _on_mirror_started(self):
         device = self._selected_device()
@@ -378,6 +480,7 @@ class MainWindow(QMainWindow):
         self._btn_mirror.setEnabled(True)
         self._status.showMessage(f"Mirroring {device.display_name if device else ''}…")
         self._mirror.start_embedding(self._launcher.window_title)
+        self._update_quality_bar()
 
     def _on_mirror_stopped(self):
         self._mirroring_serial = None
@@ -412,27 +515,38 @@ class MainWindow(QMainWindow):
 
     # ── Phone control (all off main thread) ───────────────────────────────────
 
+    def _refocus(self):
+        """Return keyboard focus to scrcpy after a toolbar action."""
+        if self._mirroring_serial:
+            self._mirror.request_scrcpy_focus()
+
     def _phone_wake(self):
         self._status.showMessage("Waking screen…")
         run_async(adb_bridge.wake,
                   on_done=lambda _: self._status.showMessage("Screen wake sent."))
+        QTimer.singleShot(150, self._refocus)
 
     def _phone_recents(self):
         run_async(adb_bridge.recent_apps)
+        QTimer.singleShot(150, self._refocus)
 
     def _phone_home(self):
         run_async(adb_bridge.home)
+        QTimer.singleShot(150, self._refocus)
 
     def _phone_back(self):
         run_async(adb_bridge.back)
+        QTimer.singleShot(150, self._refocus)
 
     def _phone_swipe_left(self):
         """Swipe left on device (next carousel item / scroll forward)."""
         run_async(adb_bridge.swipe_h, -1)
+        QTimer.singleShot(150, self._refocus)
 
     def _phone_swipe_right(self):
         """Swipe right on device (prev carousel item / scroll back)."""
         run_async(adb_bridge.swipe_h, 1)
+        QTimer.singleShot(150, self._refocus)
 
     # ── Clipboard ─────────────────────────────────────────────────────────────
 
@@ -452,44 +566,51 @@ class MainWindow(QMainWindow):
             return
         preview = text[:60].replace("\n", " ")
         self._status.showMessage(f"Sending to phone: {preview}")
-        run_async(adb_bridge.push_clipboard_text, text,
-                  on_done=lambda _: self._status.showMessage(
-                      f"Clipboard sent to phone: {preview}"))
+
+        def _done(_):
+            self._status.showMessage(f"Clipboard sent to phone: {preview}")
+            self._refocus()
+
+        run_async(adb_bridge.push_clipboard_text, text, on_done=_done)
 
     # ── Send to browser ───────────────────────────────────────────────────────
 
-    def _send_to_browser(self):
-        """Open whatever is playing/showing on the phone in the PC browser.
+    def _open_in_chrome(self, url: str) -> None:
+        """Open url in Chrome. If Chrome is not found, fall back to the default browser."""
+        chrome_candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ]
+        for path in chrome_candidates:
+            if os.path.isfile(path):
+                subprocess.Popen([path, url])
+                return
+        webbrowser.open(url)
 
-        Checks the PC clipboard first (in case scrcpy already synced a copied
-        link), then runs foreground-aware ADB extraction for YouTube, Spotify,
-        Chrome, etc.
-        """
-        clip = QApplication.clipboard().text().strip()
-        if clip.startswith(("http://", "https://")):
-            webbrowser.open(clip)
-            self._status.showMessage(f"Opened in browser: {clip[:80]}")
-            return
+    def _send_to_browser(self):
+        """Detect what's playing on the phone and open it in Chrome."""
         self._status.showMessage("Detecting what's playing on phone…")
         run_async(adb_bridge.get_foreground_url, on_done=self._on_url_found)
 
     def _on_url_found(self, url):
         if url:
-            webbrowser.open(url)
-            # Show a friendly label based on the URL
-            if "youtube.com" in url or "youtu.be" in url:
+            self._open_in_chrome(url)
+            if "youtube.com/watch" in url:
                 label = "YouTube video"
+            elif "youtube.com/results" in url:
+                label = "YouTube search"
             elif "spotify.com" in url:
                 label = "Spotify track"
             elif "netflix.com" in url:
                 label = "Netflix title"
             else:
                 label = url[:70]
-            self._status.showMessage(f"✓ Opened {label} in browser")
+            self._status.showMessage(f"✓ Opened {label} in Chrome")
         else:
             self._status.showMessage(
-                "Could not detect media — make sure YouTube/Spotify/Chrome "
-                "is in the foreground and a video or track is playing.")
+                "Nothing detected — is a YouTube video playing on the phone?")
+        QTimer.singleShot(150, self._refocus)
 
     def _focus_mirror(self):
         """Return keyboard focus to the embedded scrcpy window."""

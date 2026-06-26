@@ -9,6 +9,9 @@ class ScrcpySettings:
     max_size: int = 1080
     bitrate: str = "4M"
     max_fps: int = 60
+    wifi_max_fps: int = 30
+    wifi_max_size: int = 720
+    wifi_bitrate: str = "1M"
 
 
 @dataclass
@@ -26,12 +29,24 @@ def _settings() -> QSettings:
     return QSettings(_ORG, _APP)
 
 
+_SETTINGS_VERSION = 2  # bump when adding new fields that need fresh defaults
+
+
 def load_scrcpy_settings() -> ScrcpySettings:
     s = _settings()
+    # If schema version changed, drop old scrcpy/* keys so new defaults apply cleanly.
+    if int(s.value("scrcpy/schema_version", 0)) < _SETTINGS_VERSION:
+        for key in list(s.allKeys()):
+            if key.startswith("scrcpy/") and key != "scrcpy/schema_version":
+                s.remove(key)
+        s.setValue("scrcpy/schema_version", _SETTINGS_VERSION)
     return ScrcpySettings(
         max_size=int(s.value("scrcpy/max_size", 1080)),
         bitrate=str(s.value("scrcpy/bitrate", "4M")),
         max_fps=int(s.value("scrcpy/max_fps", 60)),
+        wifi_max_fps=int(s.value("scrcpy/wifi_max_fps", 30)),
+        wifi_max_size=int(s.value("scrcpy/wifi_max_size", 720)),
+        wifi_bitrate=str(s.value("scrcpy/wifi_bitrate", "1M")),
     )
 
 
@@ -40,6 +55,9 @@ def save_scrcpy_settings(cfg: ScrcpySettings) -> None:
     s.setValue("scrcpy/max_size", cfg.max_size)
     s.setValue("scrcpy/bitrate", cfg.bitrate)
     s.setValue("scrcpy/max_fps", cfg.max_fps)
+    s.setValue("scrcpy/wifi_max_fps", cfg.wifi_max_fps)
+    s.setValue("scrcpy/wifi_max_size", cfg.wifi_max_size)
+    s.setValue("scrcpy/wifi_bitrate", cfg.wifi_bitrate)
 
 
 def load_paired_devices() -> list[SavedDevice]:
@@ -55,7 +73,8 @@ def load_paired_devices() -> list[SavedDevice]:
 def save_paired_device(ip: str, port: int, label: str = "") -> None:
     devices = load_paired_devices()
     for d in devices:
-        if d.ip == ip and d.port == port:
+        if d.ip == ip:          # match by IP only — update port if it changed
+            d.port  = port
             d.label = label or d.label
             break
     else:

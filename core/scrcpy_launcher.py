@@ -5,9 +5,9 @@ import threading
 import psutil
 from PySide6.QtCore import QObject, Signal
 
-from app.mirror_container import MIRROR_W, MIRROR_H
 from core.settings_store import ScrcpySettings, load_scrcpy_settings
 from models.device import Device, Transport
+from app.mirror_container import MIRROR_W, MIRROR_H
 from utils.vendor_paths import adb_exe, scrcpy_dir, scrcpy_exe
 
 
@@ -77,32 +77,31 @@ class ScrcpyLauncher(QObject):
             args += ["-s", device.serial]
 
         args += [
-            "--max-size", str(settings.max_size),
             "--video-codec", "h264",
             "--window-title", self._window_title,
             "--window-borderless",
             "--no-audio",
+            # SDL must start at exactly the container size so it fills our embedded
+            # window correctly from the first frame.  MoveWindow later confirms it.
             "--window-width", str(MIRROR_W),
             "--window-height", str(MIRROR_H),
             # Keep phone screen on while mirror is active.
-            # Without this: screen timeout kills the video stream while ADB
-            # (keyevent/shell) stays alive → mirror goes black mid-session.
             "--stay-awake",
         ]
 
         if wifi:
-            # WiFi latency reduction:
-            # • Keep resolution + fps from user settings (no quality drop)
-            # • Lower bitrate to 2M — less data per frame without visible loss
-            # • 0 ms video buffer — no added delay (--stay-awake prevents black screen)
+            # WiFi Normal: 720p/30fps/1M  |  WiFi Best: 1080p/60fps/4M
+            # 50ms buffer smooths WiFi jitter; 0 causes divide-by-zero on lossy links.
             args += [
-                "--video-bit-rate", "2M",
-                "--max-fps", str(settings.max_fps),
-                "--video-buffer", "0",
+                "--max-size", str(settings.wifi_max_size),
+                "--video-bit-rate", settings.wifi_bitrate,
+                "--max-fps", str(settings.wifi_max_fps),
+                "--video-buffer", "50",
             ]
         else:
-            # USB: full user settings, zero buffer for real-time feel.
+            # USB: 1080p, 8M bitrate, zero buffer for real-time feel.
             args += [
+                "--max-size", str(settings.max_size),
                 "--video-bit-rate", settings.bitrate,
                 "--max-fps", str(settings.max_fps),
                 "--video-buffer", "0",

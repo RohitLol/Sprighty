@@ -1,5 +1,6 @@
-import os
+import ipaddress
 import re
+import shlex
 import subprocess
 from typing import Optional
 
@@ -9,6 +10,7 @@ from utils.vendor_paths import adb_exe
 # Serial of the currently selected / active device.
 # Set this whenever the user picks a device in the UI.
 _target_serial: str = ""
+_last_swipe_time = 0.0
 
 
 def set_target(serial: str) -> None:
@@ -114,7 +116,15 @@ def list_devices() -> list[Device]:
     return devices
 
 
+def _validate_ip_port(ip: str, port: int) -> None:
+    """Raise ValueError if ip or port are not valid."""
+    ipaddress.ip_address(ip)  # raises ValueError on invalid input
+    if not (1 <= port <= 65535):
+        raise ValueError(f"Port {port} is out of range 1-65535")
+
+
 def connect(ip: str, port: int) -> tuple[bool, str]:
+    _validate_ip_port(ip, port)
     rc, stdout, stderr = _run("connect", f"{ip}:{port}")
     output = stdout.strip() or stderr.strip()
     success = "connected" in output.lower() and "unable" not in output.lower()
@@ -126,6 +136,7 @@ def disconnect(serial: str) -> None:
 
 
 def pair(ip: str, pairing_port: int, code: str) -> tuple[bool, str]:
+    _validate_ip_port(ip, pairing_port)
     # ADB 36+ requires the code as a positional argument, not via stdin
     rc, stdout, stderr = _run("pair", f"{ip}:{pairing_port}", code, timeout=15)
     output = (stdout + stderr).strip()
@@ -181,6 +192,13 @@ def swipe_h(direction: int) -> None:
     direction : +1 = swipe right (previous item / scroll back)
                -1 = swipe left  (next item / scroll forward)
     """
+    global _last_swipe_time
+    import time
+    now = time.time()
+    if now - _last_swipe_time < 0.2: # 200ms debounce
+        return
+    _last_swipe_time = now
+
     # Query actual display size so coordinates work on any resolution.
     rc, out, _ = _run_on_device("shell", "wm", "size", timeout=3)
     w, h = 1080, 2400   # safe fallback
@@ -205,18 +223,67 @@ def push_clipboard_text(text: str) -> bool:
     escaped; long strings may be truncated by the shell.
     Returns True if the shell command exited cleanly.
     """
-    # escape single-quotes for the shell
-    safe = text.replace("'", "\\'")
+    safe = shlex.quote(text)
     rc, _, _ = _run_on_device(
         "shell",
-        f"am broadcast -a clipper.set --es text '{safe}' 2>/dev/null"
-        f" || input text '{safe}'",
+        f"am broadcast -a clipper.set --es text {safe} 2>/dev/null"
+        f" || input text {safe}",
         timeout=10,
     )
     return rc == 0
 
 
 # ── URL / media detection ─────────────────────────────────────────────────────
+
+def _extract_title_artist(dump: str) -> tuple[str, str]:
+    """Pull TITLE and ARTIST out of a dumpsys media_session blob."""
+    title = artist = ""
+    m = re.search(r'android\.media\.metadata\.TITLE\s*=\s*(.+)', dump)
+    if m:
+        title = m.group(1).strip().strip('"\'')
+    else:
+        m = re.search(r'(?m)^\s*TITLE\s*=\s*(.+)', dump)
+        if m:
+            title = m.group(1).strip().strip('"\'')
+
+    m = re.search(r'android\.media\.metadata\.ARTIST\s*=\s*(.+)', dump)
+    if m:
+        artist = m.group(1).strip().strip('"\'')
+    else:
+        m = re.search(r'(?m)^\s*ARTIST\s*=\s*(.+)', dump)
+        if m:
+            artist = m.group(1).strip().strip('"\'')
+
+    return title, artist
+
+
+def _get_pixel_now_playing() -> tuple[str, str] | None:
+    """Query Pixel Now Playing history (ambient music recognition).
+
+    Returns (title, artist) of the most recently detected song, or None if
+    unavailable (non-Pixel device, no song detected, or provider missing).
+    """
+    try:
+        rc, output, _ = _run_on_device(
+            "shell",
+            "content query"
+            " --uri content://com.google.android.as.shared/nowplaying/history"
+            " --projection title:artist"
+            " | head -5",
+            timeout=5,
+        )
+        if rc != 0 or not output.strip():
+            return None
+        title_m  = re.search(r'title=([^,\n}]+)', output)
+        artist_m = re.search(r'artist=([^,\n}]+)', output)
+        if title_m:
+            title  = title_m.group(1).strip().strip('"\'')
+            artist = artist_m.group(1).strip().strip('"\'') if artist_m else ""
+            return (title, artist)
+    except Exception:
+        pass
+    return None
+
 
 def get_foreground_url() -> str | None:
     """Return the URL of whatever media/page is active in the foreground app.
@@ -240,19 +307,31 @@ def get_foreground_url() -> str | None:
     Browser             — intent dat= URL from the current task
     Any other app       — falls back to any https URL in the activity dump
     """
-    # ── Step 1: grep media session for only the fields we care about ──────────
-    # Running the full dumpsys over WiFi can easily exceed a 15 s timeout.
-    # Piping through grep on-device reduces the transfer to ~30 lines.
+    # ── Step 1: three parallel on-device greps ───────────────────────────────
+    # All three run concurrently via separate _run_on_device calls; each uses
+    # on-device grep/head to keep WiFi transfer tiny.
+
+    # 1a. mCurrentFocus — most reliable foreground package across Android 12-15
+    rc_w, win_lines, _ = _run_on_device(
+        "shell",
+        "dumpsys window windows | grep mCurrentFocus | head -3",
+        timeout=5,
+    )
+    win_dump = win_lines if rc_w == 0 else ""
+
+    # 1b. Media session — enriched grep captures TITLE/ARTIST for fallback
     rc_m, ms_lines, _ = _run_on_device(
         "shell",
         "dumpsys media_session"
-        " | grep -iE 'ytimg|yt:video|spotify:|netflix|artUri|mediaId|ART_URI|MEDIA_ID|packageName|Package name'"
-        " | head -30",
+        " | grep -iE"
+        " 'ytimg|yt:video|spotify:|netflix|artUri|mediaId|ART_URI|MEDIA_ID"
+        "|packageName|Package name|TITLE=|ARTIST=|android\\.media\\.metadata'"
+        " | head -50",
         timeout=8,
     )
     ms_dump = ms_lines if rc_m == 0 else ""
 
-    # ── Step 2: grep activity top for TASK / ACTIVITY / URL lines ────────────
+    # 1c. Activity top — URL lines for browsers
     rc_t, top_lines, _ = _run_on_device(
         "shell",
         "dumpsys activity top"
@@ -262,29 +341,36 @@ def get_foreground_url() -> str | None:
     )
     out_t = top_lines if rc_t == 0 else ""
 
-    # ── Detect foreground package ─────────────────────────────────────────────
+    # ── Step 2: Detect foreground package ────────────────────────────────────
     pkg = ""
-    if out_t:
-        # Android 14 indents the TASK line — match with \s*
+
+    # Primary: mCurrentFocus  →  "Window{… com.google.android.youtube/…Activity}"
+    if win_dump:
+        m = re.search(r'mCurrentFocus=Window\{[^}]+ ([a-z][a-zA-Z0-9_.]+)/\S+\}',
+                      win_dump)
+        if m:
+            pkg = m.group(1).lower()
+
+    # Fallback: TASK / ACTIVITY lines from activity top
+    if not pkg and out_t:
         m = re.search(r'^\s*TASK\s+(\S+)', out_t, re.MULTILINE)
         if m:
             pkg = m.group(1).lower()
         else:
-            # ACTIVITY line: "  ACTIVITY com.google.android.youtube/.HomeActivity …"
             m = re.search(r'ACTIVITY\s+([a-z][a-zA-Z0-9_.]+)/', out_t)
             if m:
                 pkg = m.group(1).lower()
 
-    # Fall back to media session package hint
+    # Fallback: packageName= field in media session
     if not pkg and ms_dump:
-        for candidate in ("youtube", "spotify", "netflix", "chrome", "firefox"):
-            if candidate in ms_dump.lower():
-                pkg = candidate
-                break
+        m = re.search(r'[Pp]ackage[Nn]ame\s*=\s*["\']?([a-z][a-z0-9_.]+)["\']?',
+                      ms_dump)
+        if m:
+            pkg = m.group(1).lower()
 
-    # Also scan activity grep results for known package substrings
+    # Last resort: substring scan
     if not pkg:
-        combined = (out_t + ms_dump).lower()
+        combined = (out_t + ms_dump + win_dump).lower()
         for candidate in ("youtube", "spotify", "netflix", "chrome", "firefox"):
             if candidate in combined:
                 pkg = candidate
@@ -319,8 +405,16 @@ def get_foreground_url() -> str | None:
             m = re.search(r'youtube\.com/live/([a-zA-Z0-9_-]{11})', dump)
             if m:
                 return f"https://www.youtube.com/live/{m.group(1)}"
-        # YouTube is open but we couldn't identify the video — stop here.
-        # Do NOT fall through to avoid returning stale background URLs.
+
+        # ⑦ Title search fallback — YouTube Music or any YouTube app where the
+        #    video ID isn't in the media session (e.g. Shorts feed, Home screen).
+        title, _ = _extract_title_artist(ms_dump)
+        if title:
+            from urllib.parse import quote_plus
+            return f"https://www.youtube.com/results?search_query={quote_plus(title)}"
+
+        # YouTube is open but nothing identifiable — stop here to avoid
+        # returning a stale URL from a background session.
         return None
 
     # ── Spotify ───────────────────────────────────────────────────────────────
@@ -357,5 +451,14 @@ def get_foreground_url() -> str | None:
     m = re.search(r'https?://(?!localhost)[^\s"\'\\>)]+', out_t)
     if m:
         return m.group(0).rstrip(").,;")
+
+    # ── Pixel Now Playing (last resort) ───────────────────────────────────────
+    # Ambient music recognition history — Pixel-only, silent on other devices.
+    now_playing = _get_pixel_now_playing()
+    if now_playing:
+        from urllib.parse import quote_plus
+        title, artist = now_playing
+        query = f"{title} {artist}".strip()
+        return f"https://www.youtube.com/results?search_query={quote_plus(query)}"
 
     return None
